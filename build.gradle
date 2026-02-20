@@ -1,0 +1,82 @@
+plugins {
+    id 'java-library'
+    id 'com.google.protobuf' version '0.9.4'
+    id 'com.diffplug.spotless' version '7.0.2'
+}
+
+group = 'dev.faisca'
+version = '0.1.0'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+repositories {
+    mavenCentral()
+}
+
+def grpcVersion = '1.71.0'
+def protobufVersion = '4.29.3'
+
+dependencies {
+    api "io.grpc:grpc-stub:${grpcVersion}"
+    api "io.grpc:grpc-protobuf:${grpcVersion}"
+
+    implementation "io.grpc:grpc-netty-shaded:${grpcVersion}"
+    implementation "com.google.protobuf:protobuf-java:${protobufVersion}"
+
+    compileOnly 'org.apache.tomcat:annotations-api:6.0.53'
+
+    testImplementation platform('org.junit:junit-bom:5.11.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+protobuf {
+    protoc {
+        artifact = "com.google.protobuf:protoc:${protobufVersion}"
+    }
+    plugins {
+        grpc {
+            artifact = "io.grpc:protoc-gen-grpc-java:${grpcVersion}"
+        }
+    }
+    generateProtoTasks {
+        all()*.plugins {
+            grpc {}
+        }
+    }
+}
+
+sourceSets {
+    main {
+        proto {
+            srcDir 'proto'
+        }
+    }
+}
+
+test {
+    useJUnitPlatform()
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+        showStandardStreams = true
+    }
+}
+
+spotless {
+    java {
+        target 'src/**/*.java'
+        googleJavaFormat('1.25.2')
+    }
+}
+
+tasks.named('jar') {
+    manifest {
+        attributes(
+            'Implementation-Title': 'fila-client',
+            'Implementation-Version': version,
+        )
+    }
+}

@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build
+        run: ./gradlew build -x test
+
+      - name: Lint (spotless)
+        run: ./gradlew spotlessCheck
+
+      # Integration tests require a fila-server binary.
+      # They are skipped in CI since the binary is not available.
+      # Unit tests and lint still run.
