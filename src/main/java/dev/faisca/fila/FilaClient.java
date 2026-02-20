@@ -32,12 +32,10 @@ import java.util.function.Consumer;
 public final class FilaClient implements AutoCloseable {
   private final ManagedChannel channel;
   private final FilaServiceGrpc.FilaServiceBlockingStub blockingStub;
-  private final FilaServiceGrpc.FilaServiceStub asyncStub;
 
   private FilaClient(ManagedChannel channel) {
     this.channel = channel;
     this.blockingStub = FilaServiceGrpc.newBlockingStub(channel);
-    this.asyncStub = FilaServiceGrpc.newStub(channel);
   }
 
   /** Returns a new builder for configuring a {@link FilaClient}. */
