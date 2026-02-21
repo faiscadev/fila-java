@@ -1,6 +1,8 @@
 name: CI
 
 on:
+  push:
+    branches: [main]
   pull_request:
     branches: [main]
 
@@ -17,12 +19,32 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
+      - uses: actions/checkout@v4
+        with:
+          repository: faiscadev/fila
+          path: fila
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            fila/target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: fila-server-${{ runner.os }}-${{ hashFiles('fila/Cargo.lock') }}
+          restore-keys: fila-server-${{ runner.os }}-
+
+      - name: Build fila-server
+        run: cargo build --release -p fila-server --manifest-path fila/Cargo.toml
+
       - name: Build
         run: ./gradlew build -x test
 
       - name: Lint (spotless)
         run: ./gradlew spotlessCheck
 
-      # Integration tests require a fila-server binary.
-      # They are skipped in CI since the binary is not available.
-      # Unit tests and lint still run.
+      - name: Test
+        run: |
+          export PATH="${{ github.workspace }}/fila/target/release:$PATH"
+          ./gradlew test
