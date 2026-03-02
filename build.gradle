@@ -1,6 +1,7 @@
 plugins {
     id 'java-library'
     id 'maven-publish'
+    id 'signing'
     id 'com.google.protobuf' version '0.9.4'
     id 'com.diffplug.spotless' version '7.0.2'
 }
@@ -98,6 +99,18 @@ publishing {
                         url = 'https://www.gnu.org/licenses/agpl-3.0.html'
                     }
                 }
+                developers {
+                    developer {
+                        id = 'faiscadev'
+                        name = 'Faisca'
+                        url = 'https://github.com/faiscadev'
+                    }
+                }
+                scm {
+                    connection = 'scm:git:git://github.com/faiscadev/fila-java.git'
+                    developerConnection = 'scm:git:ssh://github.com:faiscadev/fila-java.git'
+                    url = 'https://github.com/faiscadev/fila-java'
+                }
             }
         }
     }
@@ -111,4 +124,12 @@ publishing {
             }
         }
     }
+}
+
+signing {
+    def signingKey = System.getenv('GPG_PRIVATE_KEY')
+    def signingPassword = System.getenv('GPG_PASSPHRASE')
+    useInMemoryPgpKeys(signingKey, signingPassword)
+    sign publishing.publications.maven
+    required { signingKey != null }
 }
