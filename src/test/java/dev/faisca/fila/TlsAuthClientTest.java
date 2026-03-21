@@ -81,9 +81,14 @@ class TlsAuthClientTest {
             .build()) {
       // Without an API key on an auth-enabled server, the enqueue should be rejected.
       // This validates TLS transport is working (connection succeeds) but auth is enforced.
-      assertThrows(
-          RpcException.class,
-          () -> client.enqueue("test-tls-auth", Map.of(), "tls-only".getBytes()));
+      RpcException ex =
+          assertThrows(
+              RpcException.class,
+              () -> client.enqueue("test-tls-auth", Map.of(), "tls-only".getBytes()));
+      assertEquals(
+          io.grpc.Status.Code.UNAUTHENTICATED,
+          ex.getCode(),
+          "should reject with UNAUTHENTICATED when no API key is provided");
     }
   }
 

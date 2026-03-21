@@ -276,6 +276,12 @@ public final class FilaClient implements AutoCloseable {
       ManagedChannel channel;
 
       if (caCertPem != null) {
+        // Parse host/port before the TLS try block so that NumberFormatException
+        // (a subclass of IllegalArgumentException) from address parsing is not
+        // misreported as "invalid certificate".
+        String host = parseHost(address);
+        int port = parsePort(address);
+
         try {
           TlsChannelCredentials.Builder tlsBuilder =
               TlsChannelCredentials.newBuilder().trustManager(new ByteArrayInputStream(caCertPem));
@@ -286,8 +292,7 @@ public final class FilaClient implements AutoCloseable {
           }
 
           ChannelCredentials creds = tlsBuilder.build();
-          var channelBuilder =
-              Grpc.newChannelBuilderForAddress(parseHost(address), parsePort(address), creds);
+          var channelBuilder = Grpc.newChannelBuilderForAddress(host, port, creds);
 
           if (apiKey != null) {
             channelBuilder.intercept(new ApiKeyInterceptor(apiKey));
