@@ -108,20 +108,18 @@ final class TestServer {
     deleteDirectory(dataDir);
   }
 
-  /** Returns true if the fila-server binary is available. */
+  /**
+   * Returns true if the fila-server binary is available at a known local path.
+   *
+   * <p>Note: This intentionally does NOT check PATH. The TLS integration tests require a local dev
+   * build to ensure cert generation and server config are compatible. In CI, the plaintext
+   * integration tests run via {@link FilaClientTest} using the downloaded binary; the TLS tests are
+   * skipped until the CI pipeline is configured to provision TLS test infrastructure.
+   */
   static boolean isBinaryAvailable() {
     try {
       String path = findBinary();
-      if (path == null) return false;
-      // If it's a local path, check executability directly
-      Path p = Path.of(path);
-      if (p.isAbsolute() || path.contains("/") || path.contains("\\")) {
-        return Files.isExecutable(p);
-      }
-      // For bare command names (on PATH), probe with "which"
-      Process probe = new ProcessBuilder("which", path).redirectErrorStream(true).start();
-      int exit = probe.waitFor();
-      return exit == 0;
+      return path != null && Files.isExecutable(Path.of(path));
     } catch (Exception e) {
       return false;
     }
