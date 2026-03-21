@@ -51,9 +51,11 @@ Connect over TLS by providing a CA certificate. The CA cert is used to verify th
 ```java
 byte[] caCert = Files.readAllBytes(Path.of("ca.pem"));
 
-FilaClient client = FilaClient.builder("localhost:5555")
+try (FilaClient client = FilaClient.builder("localhost:5555")
     .withTlsCaCert(caCert)
-    .build();
+    .build()) {
+    // use client...
+}
 ```
 
 For mutual TLS (mTLS), also provide the client certificate and key:
@@ -63,10 +65,12 @@ byte[] caCert = Files.readAllBytes(Path.of("ca.pem"));
 byte[] clientCert = Files.readAllBytes(Path.of("client.pem"));
 byte[] clientKey = Files.readAllBytes(Path.of("client-key.pem"));
 
-FilaClient client = FilaClient.builder("localhost:5555")
+try (FilaClient client = FilaClient.builder("localhost:5555")
     .withTlsCaCert(caCert)
     .withTlsClientCert(clientCert, clientKey)
-    .build();
+    .build()) {
+    // use client...
+}
 ```
 
 ## API Key Authentication
@@ -74,9 +78,11 @@ FilaClient client = FilaClient.builder("localhost:5555")
 When the server has auth enabled, provide an API key:
 
 ```java
-FilaClient client = FilaClient.builder("localhost:5555")
+try (FilaClient client = FilaClient.builder("localhost:5555")
     .withApiKey("your-api-key")
-    .build();
+    .build()) {
+    // use client...
+}
 ```
 
 The key is sent as a `Bearer` token in the `authorization` metadata header on every RPC.
@@ -84,11 +90,13 @@ The key is sent as a `Bearer` token in the `authorization` metadata header on ev
 TLS and API key auth can be combined:
 
 ```java
-FilaClient client = FilaClient.builder("localhost:5555")
+try (FilaClient client = FilaClient.builder("localhost:5555")
     .withTlsCaCert(caCert)
     .withTlsClientCert(clientCert, clientKey)
     .withApiKey("your-api-key")
-    .build();
+    .build()) {
+    // use client...
+}
 ```
 
 ## API Reference

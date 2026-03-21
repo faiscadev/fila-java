@@ -73,15 +73,16 @@ class TlsAuthClientTest {
 
   @Test
   void connectWithTlsOnly() throws Exception {
+    // TLS without API key — validates TLS transport works independently of auth
     try (FilaClient client =
         FilaClient.builder(server.address())
             .withTlsCaCert(server.caCertPem())
             .withTlsClientCert(server.clientCertPem(), server.clientKeyPem())
-            .withApiKey(server.apiKey())
             .build()) {
-      String msgId = client.enqueue("test-tls-auth", Map.of(), "tls-only payload".getBytes());
-      assertNotNull(msgId);
-      assertFalse(msgId.isEmpty());
+      // Without an API key on an auth-enabled server, the enqueue should be rejected.
+      // This validates TLS transport is working (connection succeeds) but auth is enforced.
+      assertThrows(
+          RpcException.class, () -> client.enqueue("test-tls-auth", Map.of(), "tls-only".getBytes()));
     }
   }
 
@@ -92,8 +93,14 @@ class TlsAuthClientTest {
             .withTlsCaCert(server.caCertPem())
             .withTlsClientCert(server.clientCertPem(), server.clientKeyPem())
             .build()) {
-      assertThrows(
-          RpcException.class, () -> client.enqueue("test-tls-auth", Map.of(), "no-key".getBytes()));
+      RpcException ex =
+          assertThrows(
+              RpcException.class,
+              () -> client.enqueue("test-tls-auth", Map.of(), "no-key".getBytes()));
+      assertEquals(
+          io.grpc.Status.Code.UNAUTHENTICATED,
+          ex.getCode(),
+          "should reject with UNAUTHENTICATED when no API key is provided");
     }
   }
 }

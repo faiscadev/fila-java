@@ -44,4 +44,15 @@ class BuilderTest {
             .withTlsClientCert("cert".getBytes(), "key".getBytes());
     assertNotNull(builder);
   }
+
+  @Test
+  void builderClientCertWithoutCaCertThrows() {
+    // Client cert without CA cert should fail fast
+    assertThrows(
+        FilaException.class,
+        () ->
+            FilaClient.builder("localhost:5555")
+                .withTlsClientCert("cert".getBytes(), "key".getBytes())
+                .build());
+  }
 }

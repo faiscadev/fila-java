@@ -268,6 +268,11 @@ public final class FilaClient implements AutoCloseable {
 
     /** Build and connect the client. */
     public FilaClient build() {
+      if (clientCertPem != null && caCertPem == null) {
+        throw new FilaException(
+            "client certificate requires a CA certificate — call withTlsCaCert() first");
+      }
+
       ManagedChannel channel;
 
       if (caCertPem != null) {
@@ -289,6 +294,8 @@ public final class FilaClient implements AutoCloseable {
           }
 
           channel = channelBuilder.build();
+        } catch (IllegalArgumentException e) {
+          throw new FilaException("failed to configure TLS: invalid certificate", e);
         } catch (IOException e) {
           throw new FilaException("failed to configure TLS", e);
         }
@@ -306,6 +313,14 @@ public final class FilaClient implements AutoCloseable {
     }
 
     private static String parseHost(String address) {
+      // Handle IPv6 bracket notation: [::1]:5555
+      if (address.startsWith("[")) {
+        int closeBracket = address.indexOf(']');
+        if (closeBracket < 0) {
+          return address;
+        }
+        return address.substring(1, closeBracket);
+      }
       int colonIdx = address.lastIndexOf(':');
       if (colonIdx < 0) {
         return address;
@@ -314,6 +329,14 @@ public final class FilaClient implements AutoCloseable {
     }
 
     private static int parsePort(String address) {
+      // Handle IPv6 bracket notation: [::1]:5555
+      if (address.startsWith("[")) {
+        int closeBracket = address.indexOf(']');
+        if (closeBracket < 0 || closeBracket + 2 > address.length()) {
+          return 5555;
+        }
+        return Integer.parseInt(address.substring(closeBracket + 2));
+      }
       int colonIdx = address.lastIndexOf(':');
       if (colonIdx < 0) {
         return 5555;

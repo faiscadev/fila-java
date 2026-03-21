@@ -112,7 +112,17 @@ final class TestServer {
   static boolean isBinaryAvailable() {
     try {
       String path = findBinary();
-      return path != null && Files.isExecutable(Path.of(path));
+      if (path == null) return false;
+      // If it's a local path, check executability directly
+      Path p = Path.of(path);
+      if (p.isAbsolute() || path.contains("/") || path.contains("\\")) {
+        return Files.isExecutable(p);
+      }
+      // For bare command names (on PATH), probe with "which"
+      Process probe =
+          new ProcessBuilder("which", path).redirectErrorStream(true).start();
+      int exit = probe.waitFor();
+      return exit == 0;
     } catch (Exception e) {
       return false;
     }
