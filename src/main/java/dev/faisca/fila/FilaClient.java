@@ -213,6 +213,7 @@ public final class FilaClient implements AutoCloseable {
   /** Builder for {@link FilaClient}. */
   public static final class Builder {
     private final String address;
+    private boolean tlsEnabled;
     private byte[] caCertPem;
     private byte[] clientCertPem;
     private byte[] clientKeyPem;
@@ -223,24 +224,39 @@ public final class FilaClient implements AutoCloseable {
     }
 
     /**
+     * Enable TLS using the JVM's default trust store (cacerts).
+     *
+     * <p>Use this when the Fila server's certificate is issued by a public CA already trusted by
+     * the JVM. For servers using self-signed or private CA certificates, use {@link
+     * #withTlsCaCert(byte[])} instead.
+     *
+     * @return this builder
+     */
+    public Builder withTls() {
+      this.tlsEnabled = true;
+      return this;
+    }
+
+    /**
      * Set the CA certificate for TLS server verification.
      *
      * <p>When set, the client connects over TLS instead of plaintext. The CA certificate is used to
-     * verify the server's identity.
+     * verify the server's identity. Implies {@link #withTls()}.
      *
      * @param caCertPem PEM-encoded CA certificate bytes
      * @return this builder
      */
     public Builder withTlsCaCert(byte[] caCertPem) {
       this.caCertPem = caCertPem;
+      this.tlsEnabled = true;
       return this;
     }
 
     /**
      * Set the client certificate and key for mutual TLS (mTLS).
      *
-     * <p>Requires {@link #withTlsCaCert(byte[])} to be set as well. When both are provided, the
-     * client presents its certificate to the server for mutual authentication.
+     * <p>Requires either {@link #withTls()} or {@link #withTlsCaCert(byte[])} to be called first.
+     * When provided, the client presents its certificate to the server for mutual authentication.
      *
      * @param certPem PEM-encoded client certificate bytes
      * @param keyPem PEM-encoded client private key bytes
@@ -268,14 +284,14 @@ public final class FilaClient implements AutoCloseable {
 
     /** Build and connect the client. */
     public FilaClient build() {
-      if (clientCertPem != null && caCertPem == null) {
-        throw new FilaException(
-            "client certificate requires a CA certificate — call withTlsCaCert() first");
+      if (clientCertPem != null && !tlsEnabled) {
+        throw new IllegalStateException(
+            "client certificate requires TLS — call withTls() or withTlsCaCert() first");
       }
 
       ManagedChannel channel;
 
-      if (caCertPem != null) {
+      if (tlsEnabled) {
         // Parse host/port before the TLS try block so that NumberFormatException
         // (a subclass of IllegalArgumentException) from address parsing is not
         // misreported as "invalid certificate".
@@ -283,8 +299,11 @@ public final class FilaClient implements AutoCloseable {
         int port = parsePort(address);
 
         try {
-          TlsChannelCredentials.Builder tlsBuilder =
-              TlsChannelCredentials.newBuilder().trustManager(new ByteArrayInputStream(caCertPem));
+          TlsChannelCredentials.Builder tlsBuilder = TlsChannelCredentials.newBuilder();
+
+          if (caCertPem != null) {
+            tlsBuilder.trustManager(new ByteArrayInputStream(caCertPem));
+          }
 
           if (clientCertPem != null && clientKeyPem != null) {
             tlsBuilder.keyManager(

@@ -46,13 +46,41 @@ class BuilderTest {
   }
 
   @Test
-  void builderClientCertWithoutCaCertThrows() {
-    // Client cert without CA cert should fail fast
+  void builderClientCertWithoutTlsThrows() {
+    // Client cert without TLS enabled should fail fast
     assertThrows(
-        FilaException.class,
+        IllegalStateException.class,
         () ->
             FilaClient.builder("localhost:5555")
                 .withTlsClientCert("cert".getBytes(), "key".getBytes())
                 .build());
+  }
+
+  @Test
+  void builderWithTlsSystemTrustDoesNotThrow() {
+    // withTls() using system trust store should create a client without error
+    FilaClient client = FilaClient.builder("localhost:5555").withTls().build();
+    assertNotNull(client);
+    client.close();
+  }
+
+  @Test
+  void builderWithTlsAndApiKeyDoesNotThrow() {
+    // withTls() combined with API key should work
+    FilaClient client =
+        FilaClient.builder("localhost:5555").withTls().withApiKey("test-key").build();
+    assertNotNull(client);
+    client.close();
+  }
+
+  @Test
+  void builderChainingWithTlsReturnsBuilder() {
+    // Verify fluent API for withTls() returns the builder for chaining
+    FilaClient.Builder builder =
+        FilaClient.builder("localhost:5555")
+            .withTls()
+            .withApiKey("key")
+            .withTlsClientCert("cert".getBytes(), "key".getBytes());
+    assertNotNull(builder);
   }
 }

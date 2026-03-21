@@ -46,7 +46,21 @@ try (FilaClient client = FilaClient.builder("localhost:5555").build()) {
 
 ## TLS
 
-Connect over TLS by providing a CA certificate. The CA cert is used to verify the server's identity:
+### System trust store (public CAs)
+
+If the Fila server uses a certificate issued by a public CA (e.g., Let's Encrypt), enable TLS with the JVM's default trust store:
+
+```java
+try (FilaClient client = FilaClient.builder("localhost:5555")
+    .withTls()
+    .build()) {
+    // use client...
+}
+```
+
+### Custom CA certificate
+
+For servers using self-signed or private CA certificates, provide the CA cert explicitly:
 
 ```java
 byte[] caCert = Files.readAllBytes(Path.of("ca.pem"));
@@ -58,7 +72,9 @@ try (FilaClient client = FilaClient.builder("localhost:5555")
 }
 ```
 
-For mutual TLS (mTLS), also provide the client certificate and key:
+### Mutual TLS (mTLS)
+
+For mutual TLS, also provide the client certificate and key. This works with both trust modes:
 
 ```java
 byte[] caCert = Files.readAllBytes(Path.of("ca.pem"));
@@ -115,7 +131,8 @@ FilaClient client = FilaClient.builder("localhost:5555").build();
 
 | Method | Description |
 |--------|-------------|
-| `withTlsCaCert(byte[] caCertPem)` | CA certificate for TLS server verification |
+| `withTls()` | Enable TLS using JVM's default trust store (cacerts) |
+| `withTlsCaCert(byte[] caCertPem)` | CA certificate for TLS server verification (implies `withTls()`) |
 | `withTlsClientCert(byte[] certPem, byte[] keyPem)` | Client cert + key for mTLS |
 | `withApiKey(String apiKey)` | API key sent as `Bearer` token on every RPC |
 
