@@ -3,10 +3,15 @@ package dev.faisca.fila;
 import fila.v1.FilaServiceGrpc;
 import fila.v1.Messages;
 import fila.v1.Service;
+import io.grpc.ChannelCredentials;
 import io.grpc.Context;
+import io.grpc.Grpc;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.StatusRuntimeException;
+import io.grpc.TlsChannelCredentials;
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -208,15 +213,112 @@ public final class FilaClient implements AutoCloseable {
   /** Builder for {@link FilaClient}. */
   public static final class Builder {
     private final String address;
+    private byte[] caCertPem;
+    private byte[] clientCertPem;
+    private byte[] clientKeyPem;
+    private String apiKey;
 
     private Builder(String address) {
       this.address = address;
     }
 
+    /**
+     * Set the CA certificate for TLS server verification.
+     *
+     * <p>When set, the client connects over TLS instead of plaintext. The CA certificate is used to
+     * verify the server's identity.
+     *
+     * @param caCertPem PEM-encoded CA certificate bytes
+     * @return this builder
+     */
+    public Builder withTlsCaCert(byte[] caCertPem) {
+      this.caCertPem = caCertPem;
+      return this;
+    }
+
+    /**
+     * Set the client certificate and key for mutual TLS (mTLS).
+     *
+     * <p>Requires {@link #withTlsCaCert(byte[])} to be set as well. When both are provided, the
+     * client presents its certificate to the server for mutual authentication.
+     *
+     * @param certPem PEM-encoded client certificate bytes
+     * @param keyPem PEM-encoded client private key bytes
+     * @return this builder
+     */
+    public Builder withTlsClientCert(byte[] certPem, byte[] keyPem) {
+      this.clientCertPem = certPem;
+      this.clientKeyPem = keyPem;
+      return this;
+    }
+
+    /**
+     * Set an API key for authentication.
+     *
+     * <p>When set, the key is sent as a {@code Bearer} token in the {@code authorization} metadata
+     * header on every outgoing RPC.
+     *
+     * @param apiKey the API key string
+     * @return this builder
+     */
+    public Builder withApiKey(String apiKey) {
+      this.apiKey = apiKey;
+      return this;
+    }
+
     /** Build and connect the client. */
     public FilaClient build() {
-      ManagedChannel channel = ManagedChannelBuilder.forTarget(address).usePlaintext().build();
+      ManagedChannel channel;
+
+      if (caCertPem != null) {
+        try {
+          TlsChannelCredentials.Builder tlsBuilder =
+              TlsChannelCredentials.newBuilder().trustManager(new ByteArrayInputStream(caCertPem));
+
+          if (clientCertPem != null && clientKeyPem != null) {
+            tlsBuilder.keyManager(
+                new ByteArrayInputStream(clientCertPem), new ByteArrayInputStream(clientKeyPem));
+          }
+
+          ChannelCredentials creds = tlsBuilder.build();
+          var channelBuilder =
+              Grpc.newChannelBuilderForAddress(parseHost(address), parsePort(address), creds);
+
+          if (apiKey != null) {
+            channelBuilder.intercept(new ApiKeyInterceptor(apiKey));
+          }
+
+          channel = channelBuilder.build();
+        } catch (IOException e) {
+          throw new FilaException("failed to configure TLS", e);
+        }
+      } else {
+        var channelBuilder = ManagedChannelBuilder.forTarget(address).usePlaintext();
+
+        if (apiKey != null) {
+          channelBuilder.intercept(new ApiKeyInterceptor(apiKey));
+        }
+
+        channel = channelBuilder.build();
+      }
+
       return new FilaClient(channel);
+    }
+
+    private static String parseHost(String address) {
+      int colonIdx = address.lastIndexOf(':');
+      if (colonIdx < 0) {
+        return address;
+      }
+      return address.substring(0, colonIdx);
+    }
+
+    private static int parsePort(String address) {
+      int colonIdx = address.lastIndexOf(':');
+      if (colonIdx < 0) {
+        return 5555;
+      }
+      return Integer.parseInt(address.substring(colonIdx + 1));
     }
   }
 }

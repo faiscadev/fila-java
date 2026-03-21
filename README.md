@@ -44,6 +44,53 @@ try (FilaClient client = FilaClient.builder("localhost:5555").build()) {
 }
 ```
 
+## TLS
+
+Connect over TLS by providing a CA certificate. The CA cert is used to verify the server's identity:
+
+```java
+byte[] caCert = Files.readAllBytes(Path.of("ca.pem"));
+
+FilaClient client = FilaClient.builder("localhost:5555")
+    .withTlsCaCert(caCert)
+    .build();
+```
+
+For mutual TLS (mTLS), also provide the client certificate and key:
+
+```java
+byte[] caCert = Files.readAllBytes(Path.of("ca.pem"));
+byte[] clientCert = Files.readAllBytes(Path.of("client.pem"));
+byte[] clientKey = Files.readAllBytes(Path.of("client-key.pem"));
+
+FilaClient client = FilaClient.builder("localhost:5555")
+    .withTlsCaCert(caCert)
+    .withTlsClientCert(clientCert, clientKey)
+    .build();
+```
+
+## API Key Authentication
+
+When the server has auth enabled, provide an API key:
+
+```java
+FilaClient client = FilaClient.builder("localhost:5555")
+    .withApiKey("your-api-key")
+    .build();
+```
+
+The key is sent as a `Bearer` token in the `authorization` metadata header on every RPC.
+
+TLS and API key auth can be combined:
+
+```java
+FilaClient client = FilaClient.builder("localhost:5555")
+    .withTlsCaCert(caCert)
+    .withTlsClientCert(clientCert, clientKey)
+    .withApiKey("your-api-key")
+    .build();
+```
+
 ## API Reference
 
 ### `FilaClient`
@@ -55,6 +102,16 @@ FilaClient client = FilaClient.builder("localhost:5555").build();
 ```
 
 `FilaClient` implements `AutoCloseable` for use with try-with-resources.
+
+#### Builder Methods
+
+| Method | Description |
+|--------|-------------|
+| `withTlsCaCert(byte[] caCertPem)` | CA certificate for TLS server verification |
+| `withTlsClientCert(byte[] certPem, byte[] keyPem)` | Client cert + key for mTLS |
+| `withApiKey(String apiKey)` | API key sent as `Bearer` token on every RPC |
+
+All builder methods are optional. When none are set, the client connects over plaintext without authentication (backward compatible).
 
 #### `enqueue(String queue, Map<String, String> headers, byte[] payload) -> String`
 
