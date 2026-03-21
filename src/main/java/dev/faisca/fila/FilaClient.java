@@ -285,7 +285,7 @@ public final class FilaClient implements AutoCloseable {
     /** Build and connect the client. */
     public FilaClient build() {
       if (clientCertPem != null && !tlsEnabled) {
-        throw new IllegalStateException(
+        throw new FilaException(
             "client certificate requires TLS — call withTls() or withTlsCaCert() first");
       }
 

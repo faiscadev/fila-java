@@ -49,7 +49,7 @@ class BuilderTest {
   void builderClientCertWithoutTlsThrows() {
     // Client cert without TLS enabled should fail fast
     assertThrows(
-        IllegalStateException.class,
+        FilaException.class,
         () ->
             FilaClient.builder("localhost:5555")
                 .withTlsClientCert("cert".getBytes(), "key".getBytes())
