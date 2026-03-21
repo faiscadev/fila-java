@@ -44,6 +44,77 @@ try (FilaClient client = FilaClient.builder("localhost:5555").build()) {
 }
 ```
 
+## TLS
+
+### System trust store (public CAs)
+
+If the Fila server uses a certificate issued by a public CA (e.g., Let's Encrypt), enable TLS with the JVM's default trust store:
+
+```java
+try (FilaClient client = FilaClient.builder("localhost:5555")
+    .withTls()
+    .build()) {
+    // use client...
+}
+```
+
+### Custom CA certificate
+
+For servers using self-signed or private CA certificates, provide the CA cert explicitly:
+
+```java
+byte[] caCert = Files.readAllBytes(Path.of("ca.pem"));
+
+try (FilaClient client = FilaClient.builder("localhost:5555")
+    .withTlsCaCert(caCert)
+    .build()) {
+    // use client...
+}
+```
+
+### Mutual TLS (mTLS)
+
+For mutual TLS, also provide the client certificate and key. This works with both trust modes:
+
+```java
+byte[] caCert = Files.readAllBytes(Path.of("ca.pem"));
+byte[] clientCert = Files.readAllBytes(Path.of("client.pem"));
+byte[] clientKey = Files.readAllBytes(Path.of("client-key.pem"));
+
+try (FilaClient client = FilaClient.builder("localhost:5555")
+    .withTlsCaCert(caCert)
+    .withTlsClientCert(clientCert, clientKey)
+    .build()) {
+    // use client...
+}
+```
+
+## API Key Authentication
+
+When the server has auth enabled, provide an API key:
+
+```java
+try (FilaClient client = FilaClient.builder("localhost:5555")
+    .withApiKey("your-api-key")
+    .build()) {
+    // use client...
+}
+```
+
+The key is sent as a `Bearer` token in the `authorization` metadata header on every RPC.
+
+TLS and API key auth can be combined:
+
+```java
+try (FilaClient client = FilaClient.builder("localhost:5555")
+    .withTlsCaCert(caCert)
+    .withTlsClientCert(clientCert, clientKey)
+    .withApiKey("your-api-key")
+    .build()) {
+    // use client...
+}
+```
+
 ## API Reference
 
 ### `FilaClient`
@@ -55,6 +126,17 @@ FilaClient client = FilaClient.builder("localhost:5555").build();
 ```
 
 `FilaClient` implements `AutoCloseable` for use with try-with-resources.
+
+#### Builder Methods
+
+| Method | Description |
+|--------|-------------|
+| `withTls()` | Enable TLS using JVM's default trust store (cacerts) |
+| `withTlsCaCert(byte[] caCertPem)` | CA certificate for TLS server verification (implies `withTls()`) |
+| `withTlsClientCert(byte[] certPem, byte[] keyPem)` | Client cert + key for mTLS |
+| `withApiKey(String apiKey)` | API key sent as `Bearer` token on every RPC |
+
+All builder methods are optional. When none are set, the client connects over plaintext without authentication (backward compatible).
 
 #### `enqueue(String queue, Map<String, String> headers, byte[] payload) -> String`
 

@@ -3,10 +3,15 @@ package dev.faisca.fila;
 import fila.v1.FilaServiceGrpc;
 import fila.v1.Messages;
 import fila.v1.Service;
+import io.grpc.ChannelCredentials;
 import io.grpc.Context;
+import io.grpc.Grpc;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.StatusRuntimeException;
+import io.grpc.TlsChannelCredentials;
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -208,15 +213,159 @@ public final class FilaClient implements AutoCloseable {
   /** Builder for {@link FilaClient}. */
   public static final class Builder {
     private final String address;
+    private boolean tlsEnabled;
+    private byte[] caCertPem;
+    private byte[] clientCertPem;
+    private byte[] clientKeyPem;
+    private String apiKey;
 
     private Builder(String address) {
       this.address = address;
     }
 
+    /**
+     * Enable TLS using the JVM's default trust store (cacerts).
+     *
+     * <p>Use this when the Fila server's certificate is issued by a public CA already trusted by
+     * the JVM. For servers using self-signed or private CA certificates, use {@link
+     * #withTlsCaCert(byte[])} instead.
+     *
+     * @return this builder
+     */
+    public Builder withTls() {
+      this.tlsEnabled = true;
+      return this;
+    }
+
+    /**
+     * Set the CA certificate for TLS server verification.
+     *
+     * <p>When set, the client connects over TLS instead of plaintext. The CA certificate is used to
+     * verify the server's identity. Implies {@link #withTls()}.
+     *
+     * @param caCertPem PEM-encoded CA certificate bytes
+     * @return this builder
+     */
+    public Builder withTlsCaCert(byte[] caCertPem) {
+      this.caCertPem = caCertPem;
+      this.tlsEnabled = true;
+      return this;
+    }
+
+    /**
+     * Set the client certificate and key for mutual TLS (mTLS).
+     *
+     * <p>Requires either {@link #withTls()} or {@link #withTlsCaCert(byte[])} to be called first.
+     * When provided, the client presents its certificate to the server for mutual authentication.
+     *
+     * @param certPem PEM-encoded client certificate bytes
+     * @param keyPem PEM-encoded client private key bytes
+     * @return this builder
+     */
+    public Builder withTlsClientCert(byte[] certPem, byte[] keyPem) {
+      this.clientCertPem = certPem;
+      this.clientKeyPem = keyPem;
+      return this;
+    }
+
+    /**
+     * Set an API key for authentication.
+     *
+     * <p>When set, the key is sent as a {@code Bearer} token in the {@code authorization} metadata
+     * header on every outgoing RPC.
+     *
+     * @param apiKey the API key string
+     * @return this builder
+     */
+    public Builder withApiKey(String apiKey) {
+      this.apiKey = apiKey;
+      return this;
+    }
+
     /** Build and connect the client. */
     public FilaClient build() {
-      ManagedChannel channel = ManagedChannelBuilder.forTarget(address).usePlaintext().build();
+      if (clientCertPem != null && !tlsEnabled) {
+        throw new FilaException(
+            "client certificate requires TLS — call withTls() or withTlsCaCert() first");
+      }
+
+      ManagedChannel channel;
+
+      if (tlsEnabled) {
+        // Parse host/port before the TLS try block so that NumberFormatException
+        // (a subclass of IllegalArgumentException) from address parsing is not
+        // misreported as "invalid certificate".
+        String host = parseHost(address);
+        int port = parsePort(address);
+
+        try {
+          TlsChannelCredentials.Builder tlsBuilder = TlsChannelCredentials.newBuilder();
+
+          if (caCertPem != null) {
+            tlsBuilder.trustManager(new ByteArrayInputStream(caCertPem));
+          }
+
+          if (clientCertPem != null && clientKeyPem != null) {
+            tlsBuilder.keyManager(
+                new ByteArrayInputStream(clientCertPem), new ByteArrayInputStream(clientKeyPem));
+          }
+
+          ChannelCredentials creds = tlsBuilder.build();
+          var channelBuilder = Grpc.newChannelBuilderForAddress(host, port, creds);
+
+          if (apiKey != null) {
+            channelBuilder.intercept(new ApiKeyInterceptor(apiKey));
+          }
+
+          channel = channelBuilder.build();
+        } catch (IllegalArgumentException e) {
+          throw new FilaException("failed to configure TLS: invalid certificate", e);
+        } catch (IOException e) {
+          throw new FilaException("failed to configure TLS", e);
+        }
+      } else {
+        var channelBuilder = ManagedChannelBuilder.forTarget(address).usePlaintext();
+
+        if (apiKey != null) {
+          channelBuilder.intercept(new ApiKeyInterceptor(apiKey));
+        }
+
+        channel = channelBuilder.build();
+      }
+
       return new FilaClient(channel);
+    }
+
+    private static String parseHost(String address) {
+      // Handle IPv6 bracket notation: [::1]:5555
+      if (address.startsWith("[")) {
+        int closeBracket = address.indexOf(']');
+        if (closeBracket < 0) {
+          return address;
+        }
+        return address.substring(1, closeBracket);
+      }
+      int colonIdx = address.lastIndexOf(':');
+      if (colonIdx < 0) {
+        return address;
+      }
+      return address.substring(0, colonIdx);
+    }
+
+    private static int parsePort(String address) {
+      // Handle IPv6 bracket notation: [::1]:5555
+      if (address.startsWith("[")) {
+        int closeBracket = address.indexOf(']');
+        if (closeBracket < 0 || closeBracket + 2 > address.length()) {
+          return 5555;
+        }
+        return Integer.parseInt(address.substring(closeBracket + 2));
+      }
+      int colonIdx = address.lastIndexOf(':');
+      if (colonIdx < 0) {
+        return 5555;
+      }
+      return Integer.parseInt(address.substring(colonIdx + 1));
     }
   }
 }
