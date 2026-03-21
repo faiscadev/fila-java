@@ -82,7 +82,8 @@ class TlsAuthClientTest {
       // Without an API key on an auth-enabled server, the enqueue should be rejected.
       // This validates TLS transport is working (connection succeeds) but auth is enforced.
       assertThrows(
-          RpcException.class, () -> client.enqueue("test-tls-auth", Map.of(), "tls-only".getBytes()));
+          RpcException.class,
+          () -> client.enqueue("test-tls-auth", Map.of(), "tls-only".getBytes()));
     }
   }
 

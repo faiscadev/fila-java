@@ -119,8 +119,7 @@ final class TestServer {
         return Files.isExecutable(p);
       }
       // For bare command names (on PATH), probe with "which"
-      Process probe =
-          new ProcessBuilder("which", path).redirectErrorStream(true).start();
+      Process probe = new ProcessBuilder("which", path).redirectErrorStream(true).start();
       int exit = probe.waitFor();
       return exit == 0;
     } catch (Exception e) {
