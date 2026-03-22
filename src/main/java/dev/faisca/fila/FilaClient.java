@@ -8,6 +8,7 @@ import io.grpc.Context;
 import io.grpc.Grpc;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
+import io.grpc.Metadata;
 import io.grpc.StatusRuntimeException;
 import io.grpc.TlsChannelCredentials;
 import java.io.ByteArrayInputStream;
@@ -35,12 +36,28 @@ import java.util.function.Consumer;
  * }</pre>
  */
 public final class FilaClient implements AutoCloseable {
+  private static final Metadata.Key<String> LEADER_ADDR_KEY =
+      Metadata.Key.of("x-fila-leader-addr", Metadata.ASCII_STRING_MARSHALLER);
+
   private final ManagedChannel channel;
   private final FilaServiceGrpc.FilaServiceBlockingStub blockingStub;
+  private final byte[] caCertPem;
+  private final byte[] clientCertPem;
+  private final byte[] clientKeyPem;
+  private final String apiKey;
 
-  private FilaClient(ManagedChannel channel) {
+  private FilaClient(
+      ManagedChannel channel,
+      byte[] caCertPem,
+      byte[] clientCertPem,
+      byte[] clientKeyPem,
+      String apiKey) {
     this.channel = channel;
     this.blockingStub = FilaServiceGrpc.newBlockingStub(channel);
+    this.caCertPem = caCertPem;
+    this.clientCertPem = clientCertPem;
+    this.clientKeyPem = clientKeyPem;
+    this.apiKey = apiKey;
   }
 
   /** Returns a new builder for configuring a {@link FilaClient}. */
@@ -96,15 +113,15 @@ public final class FilaClient implements AutoCloseable {
                   () -> {
                     try {
                       Iterator<Service.ConsumeResponse> stream = blockingStub.consume(req);
-                      while (stream.hasNext()) {
-                        Service.ConsumeResponse resp = stream.next();
-                        if (!resp.hasMessage() || resp.getMessage().getId().isEmpty()) {
-                          continue;
-                        }
-                        handler.accept(buildConsumeMessage(resp.getMessage()));
-                      }
+                      consumeStream(stream, handler);
                     } catch (StatusRuntimeException e) {
-                      if (e.getStatus().getCode() != io.grpc.Status.Code.CANCELLED) {
+                      if (e.getStatus().getCode() == io.grpc.Status.Code.CANCELLED) {
+                        return;
+                      }
+                      String leaderAddr = extractLeaderAddr(e);
+                      if (leaderAddr != null) {
+                        retryOnLeader(leaderAddr, req, handler);
+                      } else {
                         throw mapConsumeError(e);
                       }
                     }
@@ -168,6 +185,76 @@ public final class FilaClient implements AutoCloseable {
     } catch (InterruptedException e) {
       channel.shutdownNow();
       Thread.currentThread().interrupt();
+    }
+  }
+
+  private static void consumeStream(
+      Iterator<Service.ConsumeResponse> stream, Consumer<ConsumeMessage> handler) {
+    while (stream.hasNext()) {
+      Service.ConsumeResponse resp = stream.next();
+      if (!resp.hasMessage() || resp.getMessage().getId().isEmpty()) {
+        continue;
+      }
+      handler.accept(buildConsumeMessage(resp.getMessage()));
+    }
+  }
+
+  private static String extractLeaderAddr(StatusRuntimeException e) {
+    if (e.getStatus().getCode() != io.grpc.Status.Code.UNAVAILABLE) {
+      return null;
+    }
+    Metadata trailers = e.getTrailers();
+    if (trailers == null) {
+      return null;
+    }
+    return trailers.get(LEADER_ADDR_KEY);
+  }
+
+  private void retryOnLeader(
+      String leaderAddr,
+      Service.ConsumeRequest req,
+      Consumer<ConsumeMessage> handler) {
+    ManagedChannel leaderChannel = buildChannel(leaderAddr);
+    try {
+      FilaServiceGrpc.FilaServiceBlockingStub leaderStub =
+          FilaServiceGrpc.newBlockingStub(leaderChannel);
+      Iterator<Service.ConsumeResponse> stream = leaderStub.consume(req);
+      consumeStream(stream, handler);
+    } catch (StatusRuntimeException e) {
+      if (e.getStatus().getCode() != io.grpc.Status.Code.CANCELLED) {
+        throw mapConsumeError(e);
+      }
+    } finally {
+      leaderChannel.shutdown();
+    }
+  }
+
+  private ManagedChannel buildChannel(String address) {
+    if (caCertPem != null) {
+      try {
+        TlsChannelCredentials.Builder tlsBuilder =
+            TlsChannelCredentials.newBuilder().trustManager(new ByteArrayInputStream(caCertPem));
+        if (clientCertPem != null && clientKeyPem != null) {
+          tlsBuilder.keyManager(
+              new ByteArrayInputStream(clientCertPem), new ByteArrayInputStream(clientKeyPem));
+        }
+        ChannelCredentials creds = tlsBuilder.build();
+        var channelBuilder =
+            Grpc.newChannelBuilderForAddress(
+                Builder.parseHost(address), Builder.parsePort(address), creds);
+        if (apiKey != null) {
+          channelBuilder.intercept(new ApiKeyInterceptor(apiKey));
+        }
+        return channelBuilder.build();
+      } catch (IOException e) {
+        throw new FilaException("failed to configure TLS for leader redirect", e);
+      }
+    } else {
+      var channelBuilder = ManagedChannelBuilder.forTarget(address).usePlaintext();
+      if (apiKey != null) {
+        channelBuilder.intercept(new ApiKeyInterceptor(apiKey));
+      }
+      return channelBuilder.build();
     }
   }
 
@@ -333,10 +420,10 @@ public final class FilaClient implements AutoCloseable {
         channel = channelBuilder.build();
       }
 
-      return new FilaClient(channel);
+      return new FilaClient(channel, caCertPem, clientCertPem, clientKeyPem, apiKey);
     }
 
-    private static String parseHost(String address) {
+    static String parseHost(String address) {
       // Handle IPv6 bracket notation: [::1]:5555
       if (address.startsWith("[")) {
         int closeBracket = address.indexOf(']');
@@ -352,7 +439,7 @@ public final class FilaClient implements AutoCloseable {
       return address.substring(0, colonIdx);
     }
 
-    private static int parsePort(String address) {
+    static int parsePort(String address) {
       // Handle IPv6 bracket notation: [::1]:5555
       if (address.startsWith("[")) {
         int closeBracket = address.indexOf(']');
