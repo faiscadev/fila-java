@@ -239,9 +239,7 @@ public final class FilaClient implements AutoCloseable {
   }
 
   private void retryOnLeader(
-      String leaderAddr,
-      Service.ConsumeRequest req,
-      Consumer<ConsumeMessage> handler) {
+      String leaderAddr, Service.ConsumeRequest req, Consumer<ConsumeMessage> handler) {
     validateLeaderAddr(leaderAddr);
     ManagedChannel leaderChannel = buildChannel(leaderAddr);
     try {
