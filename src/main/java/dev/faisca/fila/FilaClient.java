@@ -210,10 +210,39 @@ public final class FilaClient implements AutoCloseable {
     return trailers.get(LEADER_ADDR_KEY);
   }
 
+  private static void validateLeaderAddr(String addr) {
+    if (addr == null || addr.isEmpty()) {
+      throw new FilaException("invalid leader address: empty");
+    }
+    // Must not contain scheme (e.g. "http://") or path (e.g. "/foo")
+    if (addr.contains("//") || addr.contains("/")) {
+      throw new FilaException("invalid leader address: must be host:port, got: " + addr);
+    }
+    int colonIdx = addr.lastIndexOf(':');
+    if (colonIdx < 0) {
+      throw new FilaException("invalid leader address: missing port, got: " + addr);
+    }
+    String host = addr.substring(0, colonIdx);
+    String portStr = addr.substring(colonIdx + 1);
+    if (host.isEmpty()) {
+      throw new FilaException("invalid leader address: empty host, got: " + addr);
+    }
+    int port;
+    try {
+      port = Integer.parseInt(portStr);
+    } catch (NumberFormatException e) {
+      throw new FilaException("invalid leader address: non-numeric port, got: " + addr);
+    }
+    if (port < 1 || port > 65535) {
+      throw new FilaException("invalid leader address: port out of range, got: " + addr);
+    }
+  }
+
   private void retryOnLeader(
       String leaderAddr,
       Service.ConsumeRequest req,
       Consumer<ConsumeMessage> handler) {
+    validateLeaderAddr(leaderAddr);
     ManagedChannel leaderChannel = buildChannel(leaderAddr);
     try {
       FilaServiceGrpc.FilaServiceBlockingStub leaderStub =
