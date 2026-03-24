@@ -9,8 +9,35 @@ class BuilderTest {
 
   @Test
   void builderPlaintextDoesNotThrow() {
-    // Plaintext builder should create a client without error
+    // Plaintext builder should create a client without error (default AUTO batching)
     FilaClient client = FilaClient.builder("localhost:5555").build();
+    assertNotNull(client);
+    client.close();
+  }
+
+  @Test
+  void builderWithBatchDisabledDoesNotThrow() {
+    // Plaintext builder with batching disabled
+    FilaClient client =
+        FilaClient.builder("localhost:5555").withBatchMode(BatchMode.disabled()).build();
+    assertNotNull(client);
+    client.close();
+  }
+
+  @Test
+  void builderWithBatchAutoDoesNotThrow() {
+    // Explicit AUTO batch mode
+    FilaClient client =
+        FilaClient.builder("localhost:5555").withBatchMode(BatchMode.auto(50)).build();
+    assertNotNull(client);
+    client.close();
+  }
+
+  @Test
+  void builderWithBatchLingerDoesNotThrow() {
+    // LINGER batch mode
+    FilaClient client =
+        FilaClient.builder("localhost:5555").withBatchMode(BatchMode.linger(10, 50)).build();
     assertNotNull(client);
     client.close();
   }
@@ -40,6 +67,7 @@ class BuilderTest {
     FilaClient.Builder builder =
         FilaClient.builder("localhost:5555")
             .withApiKey("key")
+            .withBatchMode(BatchMode.auto())
             .withTlsCaCert("cert".getBytes())
             .withTlsClientCert("cert".getBytes(), "key".getBytes());
     assertNotNull(builder);
