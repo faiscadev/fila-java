@@ -13,15 +13,23 @@ import io.grpc.StatusRuntimeException;
 import io.grpc.TlsChannelCredentials;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
 /**
  * Client for the Fila message broker.
  *
- * <p>Wraps the hot-path gRPC operations: enqueue, consume, ack, nack.
+ * <p>Wraps the hot-path gRPC operations: enqueue, batch enqueue, consume, ack, nack.
+ *
+ * <p>By default, {@code enqueue()} routes through an opportunistic batcher that coalesces messages
+ * at high load without adding latency at low load. Use {@link Builder#withBatchMode(BatchMode)} to
+ * configure batching behavior.
  *
  * <pre>{@code
  * try (FilaClient client = FilaClient.builder("localhost:5555").build()) {
@@ -45,19 +53,22 @@ public final class FilaClient implements AutoCloseable {
   private final byte[] clientCertPem;
   private final byte[] clientKeyPem;
   private final String apiKey;
+  private final Batcher batcher;
 
   private FilaClient(
       ManagedChannel channel,
       byte[] caCertPem,
       byte[] clientCertPem,
       byte[] clientKeyPem,
-      String apiKey) {
+      String apiKey,
+      Batcher batcher) {
     this.channel = channel;
     this.blockingStub = FilaServiceGrpc.newBlockingStub(channel);
     this.caCertPem = caCertPem;
     this.clientCertPem = clientCertPem;
     this.clientKeyPem = clientKeyPem;
     this.apiKey = apiKey;
+    this.batcher = batcher;
   }
 
   /** Returns a new builder for configuring a {@link FilaClient}. */
@@ -68,6 +79,10 @@ public final class FilaClient implements AutoCloseable {
   /**
    * Enqueue a message to the specified queue.
    *
+   * <p>When batching is enabled (the default), the message is submitted to the background batcher
+   * and may be coalesced with other messages. The method blocks until the message is acknowledged
+   * by the broker.
+   *
    * @param queue target queue name
    * @param headers message headers (may be empty)
    * @param payload message payload bytes
@@ -76,24 +91,78 @@ public final class FilaClient implements AutoCloseable {
    * @throws RpcException for unexpected gRPC failures
    */
   public String enqueue(String queue, Map<String, String> headers, byte[] payload) {
-    Service.EnqueueRequest req =
-        Service.EnqueueRequest.newBuilder()
-            .setQueue(queue)
-            .putAllHeaders(headers)
-            .setPayload(com.google.protobuf.ByteString.copyFrom(payload))
-            .build();
+    if (batcher != null) {
+      CompletableFuture<String> future =
+          batcher.submit(new EnqueueMessage(queue, headers, payload));
+      try {
+        return future.get();
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new FilaException("enqueue interrupted", e);
+      } catch (ExecutionException e) {
+        Throwable cause = e.getCause();
+        if (cause instanceof FilaException) {
+          throw (FilaException) cause;
+        }
+        throw new RpcException(io.grpc.Status.Code.INTERNAL, cause.getMessage());
+      }
+    }
+
+    return enqueueDirect(queue, headers, payload);
+  }
+
+  /**
+   * Enqueue a batch of messages in a single RPC call.
+   *
+   * <p>Each message is independently validated and processed. A failed message does not affect the
+   * others in the batch. Returns a list of results with one entry per input message, in the same
+   * order.
+   *
+   * <p>This bypasses the batcher and always uses the {@code BatchEnqueue} RPC directly.
+   *
+   * @param messages the messages to enqueue
+   * @return a list of results, one per input message
+   * @throws RpcException for transport-level failures affecting the entire batch
+   */
+  public List<BatchEnqueueResult> batchEnqueue(List<EnqueueMessage> messages) {
+    Service.BatchEnqueueRequest.Builder reqBuilder = Service.BatchEnqueueRequest.newBuilder();
+    for (EnqueueMessage msg : messages) {
+      reqBuilder.addMessages(
+          Service.EnqueueRequest.newBuilder()
+              .setQueue(msg.getQueue())
+              .putAllHeaders(msg.getHeaders())
+              .setPayload(com.google.protobuf.ByteString.copyFrom(msg.getPayload()))
+              .build());
+    }
+
     try {
-      Service.EnqueueResponse resp = blockingStub.enqueue(req);
-      return resp.getMessageId();
+      Service.BatchEnqueueResponse resp = blockingStub.batchEnqueue(reqBuilder.build());
+      List<Service.BatchEnqueueResult> protoResults = resp.getResultsList();
+      List<BatchEnqueueResult> results = new ArrayList<>(protoResults.size());
+      for (Service.BatchEnqueueResult r : protoResults) {
+        switch (r.getResultCase()) {
+          case SUCCESS:
+            results.add(BatchEnqueueResult.success(r.getSuccess().getMessageId()));
+            break;
+          case ERROR:
+            results.add(BatchEnqueueResult.error(r.getError()));
+            break;
+          default:
+            results.add(BatchEnqueueResult.error("no result from server"));
+            break;
+        }
+      }
+      return results;
     } catch (StatusRuntimeException e) {
-      throw mapEnqueueError(e);
+      throw mapBatchEnqueueError(e);
     }
   }
 
   /**
    * Open a streaming consumer on the specified queue.
    *
-   * <p>Messages are delivered to the handler on a background thread. Nacked messages are
+   * <p>Messages are delivered to the handler on a background thread. The handler transparently
+   * receives messages from both singular and batched server responses. Nacked messages are
    * redelivered on the same stream. Call {@link ConsumerHandle#cancel()} to stop consuming.
    *
    * @param queue queue to consume from
@@ -174,9 +243,16 @@ public final class FilaClient implements AutoCloseable {
     }
   }
 
-  /** Shut down the underlying gRPC channel. */
+  /**
+   * Shut down the client, draining any pending batched messages before disconnecting.
+   *
+   * <p>If a batcher is running, pending messages are flushed before the gRPC channel is closed.
+   */
   @Override
   public void close() {
+    if (batcher != null) {
+      batcher.shutdown();
+    }
     channel.shutdown();
     try {
       if (!channel.awaitTermination(5, TimeUnit.SECONDS)) {
@@ -188,14 +264,46 @@ public final class FilaClient implements AutoCloseable {
     }
   }
 
+  /** Direct single-message enqueue RPC (no batcher). */
+  private String enqueueDirect(String queue, Map<String, String> headers, byte[] payload) {
+    Service.EnqueueRequest req =
+        Service.EnqueueRequest.newBuilder()
+            .setQueue(queue)
+            .putAllHeaders(headers)
+            .setPayload(com.google.protobuf.ByteString.copyFrom(payload))
+            .build();
+    try {
+      Service.EnqueueResponse resp = blockingStub.enqueue(req);
+      return resp.getMessageId();
+    } catch (StatusRuntimeException e) {
+      throw mapEnqueueError(e);
+    }
+  }
+
+  /**
+   * Consume a stream, unpacking both singular and batched responses into individual messages.
+   *
+   * <p>Prefers the batched {@code messages} field when non-empty, falling back to the singular
+   * {@code message} field for backward compatibility with older servers.
+   */
   private static void consumeStream(
       Iterator<Service.ConsumeResponse> stream, Consumer<ConsumeMessage> handler) {
     while (stream.hasNext()) {
       Service.ConsumeResponse resp = stream.next();
-      if (!resp.hasMessage() || resp.getMessage().getId().isEmpty()) {
-        continue;
+
+      // Prefer the batched messages field when non-empty.
+      List<Messages.Message> batchedMessages = resp.getMessagesList();
+      if (!batchedMessages.isEmpty()) {
+        for (Messages.Message msg : batchedMessages) {
+          if (msg.getId().isEmpty()) {
+            continue;
+          }
+          handler.accept(buildConsumeMessage(msg));
+        }
+      } else if (resp.hasMessage() && !resp.getMessage().getId().isEmpty()) {
+        // Fall back to singular message for backward compatibility.
+        handler.accept(buildConsumeMessage(resp.getMessage()));
       }
-      handler.accept(buildConsumeMessage(resp.getMessage()));
     }
   }
 
@@ -230,7 +338,7 @@ public final class FilaClient implements AutoCloseable {
     int port;
     try {
       port = Integer.parseInt(portStr);
-    } catch (NumberFormatException e) {
+    } catch (NumberFormatException ex) {
       throw new FilaException("invalid leader address: non-numeric port, got: " + addr);
     }
     if (port < 1 || port > 65535) {
@@ -296,9 +404,17 @@ public final class FilaClient implements AutoCloseable {
         meta.getQueueId());
   }
 
-  private static FilaException mapEnqueueError(StatusRuntimeException e) {
+  static FilaException mapEnqueueError(StatusRuntimeException e) {
     return switch (e.getStatus().getCode()) {
       case NOT_FOUND -> new QueueNotFoundException("enqueue: " + e.getStatus().getDescription());
+      default -> new RpcException(e.getStatus().getCode(), e.getStatus().getDescription());
+    };
+  }
+
+  static FilaException mapBatchEnqueueError(StatusRuntimeException e) {
+    return switch (e.getStatus().getCode()) {
+      case NOT_FOUND ->
+          new QueueNotFoundException("batch enqueue: " + e.getStatus().getDescription());
       default -> new RpcException(e.getStatus().getCode(), e.getStatus().getDescription());
     };
   }
@@ -332,6 +448,7 @@ public final class FilaClient implements AutoCloseable {
     private byte[] clientCertPem;
     private byte[] clientKeyPem;
     private String apiKey;
+    private BatchMode batchMode = BatchMode.auto();
 
     private Builder(String address) {
       this.address = address;
@@ -396,6 +513,20 @@ public final class FilaClient implements AutoCloseable {
       return this;
     }
 
+    /**
+     * Set the batching mode for {@link FilaClient#enqueue} calls.
+     *
+     * <p>Default is {@link BatchMode#auto()} -- opportunistic batching. Use {@link
+     * BatchMode#disabled()} to turn off batching entirely.
+     *
+     * @param batchMode the batch mode
+     * @return this builder
+     */
+    public Builder withBatchMode(BatchMode batchMode) {
+      this.batchMode = batchMode;
+      return this;
+    }
+
     /** Build and connect the client. */
     public FilaClient build() {
       if (clientCertPem != null && !tlsEnabled) {
@@ -447,7 +578,19 @@ public final class FilaClient implements AutoCloseable {
         channel = channelBuilder.build();
       }
 
-      return new FilaClient(channel, caCertPem, clientCertPem, clientKeyPem, apiKey);
+      Batcher batcherInstance = null;
+      if (batchMode.getKind() != BatchMode.Kind.DISABLED) {
+        FilaServiceGrpc.FilaServiceBlockingStub batcherStub =
+            FilaServiceGrpc.newBlockingStub(channel);
+        if (apiKey != null) {
+          // The stub needs the interceptor applied at channel level (already done above).
+          // No additional interceptor needed on the stub.
+        }
+        batcherInstance = new Batcher(batcherStub, batchMode);
+      }
+
+      return new FilaClient(
+          channel, caCertPem, clientCertPem, clientKeyPem, apiKey, batcherInstance);
     }
 
     static String parseHost(String address) {
