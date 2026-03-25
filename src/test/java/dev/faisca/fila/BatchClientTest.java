@@ -16,7 +16,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIf;
 
 /**
- * Integration tests for batch enqueue and smart batching.
+ * Integration tests for enqueueMany and smart batching.
  *
  * <p>Requires a fila-server binary. Skipped if not available.
  */
@@ -45,7 +45,7 @@ class BatchClientTest {
   }
 
   @Test
-  void explicitBatchEnqueue() {
+  void explicitEnqueueMany() {
     try (FilaClient client =
         FilaClient.builder(server.address()).withBatchMode(BatchMode.disabled()).build()) {
       List<EnqueueMessage> messages = new ArrayList<>();
@@ -57,11 +57,11 @@ class BatchClientTest {
                 ("batch-msg-" + i).getBytes()));
       }
 
-      List<BatchEnqueueResult> results = client.batchEnqueue(messages);
+      List<EnqueueResult> results = client.enqueueMany(messages);
       assertEquals(5, results.size());
 
       Set<String> ids = new HashSet<>();
-      for (BatchEnqueueResult result : results) {
+      for (EnqueueResult result : results) {
         assertTrue(result.isSuccess(), "each message should succeed");
         assertFalse(result.getMessageId().isEmpty());
         ids.add(result.getMessageId());
@@ -71,7 +71,7 @@ class BatchClientTest {
   }
 
   @Test
-  void explicitBatchWithNonexistentQueue() {
+  void explicitEnqueueManyWithNonexistentQueue() {
     try (FilaClient client =
         FilaClient.builder(server.address()).withBatchMode(BatchMode.disabled()).build()) {
       List<EnqueueMessage> messages = new ArrayList<>();
@@ -79,7 +79,7 @@ class BatchClientTest {
       messages.add(new EnqueueMessage("no-such-queue", Map.of(), "bad-msg".getBytes()));
       messages.add(new EnqueueMessage("test-batch-explicit", Map.of(), "another-good".getBytes()));
 
-      List<BatchEnqueueResult> results = client.batchEnqueue(messages);
+      List<EnqueueResult> results = client.enqueueMany(messages);
       assertEquals(3, results.size());
 
       // First and third should succeed, second should fail
