@@ -219,11 +219,15 @@ public final class FilaClient implements AutoCloseable {
     try {
       Service.AckResponse resp = blockingStub.ack(req);
       List<Service.AckResult> results = resp.getResultsList();
-      if (!results.isEmpty()) {
-        Service.AckResult first = results.get(0);
-        if (first.getResultCase() == Service.AckResult.ResultCase.ERROR) {
-          throw mapAckResultError(first.getError());
-        }
+      if (results.size() != 1) {
+        throw new RpcException(io.grpc.Status.Code.INTERNAL, "no result from server");
+      }
+      Service.AckResult first = results.get(0);
+      if (first.getResultCase() == Service.AckResult.ResultCase.ERROR) {
+        throw mapAckResultError(first.getError());
+      }
+      if (first.getResultCase() == Service.AckResult.ResultCase.RESULT_NOT_SET) {
+        throw new RpcException(io.grpc.Status.Code.INTERNAL, "no result from server");
       }
     } catch (StatusRuntimeException e) {
       throw mapAckError(e);
@@ -252,11 +256,15 @@ public final class FilaClient implements AutoCloseable {
     try {
       Service.NackResponse resp = blockingStub.nack(req);
       List<Service.NackResult> results = resp.getResultsList();
-      if (!results.isEmpty()) {
-        Service.NackResult first = results.get(0);
-        if (first.getResultCase() == Service.NackResult.ResultCase.ERROR) {
-          throw mapNackResultError(first.getError());
-        }
+      if (results.size() != 1) {
+        throw new RpcException(io.grpc.Status.Code.INTERNAL, "no result from server");
+      }
+      Service.NackResult first = results.get(0);
+      if (first.getResultCase() == Service.NackResult.ResultCase.ERROR) {
+        throw mapNackResultError(first.getError());
+      }
+      if (first.getResultCase() == Service.NackResult.ResultCase.RESULT_NOT_SET) {
+        throw new RpcException(io.grpc.Status.Code.INTERNAL, "no result from server");
       }
     } catch (StatusRuntimeException e) {
       throw mapNackError(e);
