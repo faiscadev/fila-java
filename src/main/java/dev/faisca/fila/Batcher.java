@@ -15,10 +15,11 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Background batcher that coalesces individual enqueue calls into batch RPCs.
+ * Background batcher that coalesces individual enqueue calls into multi-message RPCs.
  *
  * <p>Supports two modes: AUTO (opportunistic, Nagle-style) and LINGER (timer-based). The batcher
- * runs on a dedicated daemon thread and flushes RPCs on an executor pool.
+ * runs on a dedicated daemon thread and flushes RPCs on an executor pool. Uses the unified Enqueue
+ * RPC with repeated messages for all batch sizes.
  */
 final class Batcher {
   private final LinkedBlockingQueue<BatchItem> queue = new LinkedBlockingQueue<>();
@@ -199,45 +200,16 @@ final class Batcher {
     }
   }
 
-  /**
-   * Flush a batch of messages. Uses single-message Enqueue RPC for 1 message (preserves error
-   * types), BatchEnqueue for 2+ messages.
-   */
+  /** Flush a batch of messages via the unified Enqueue RPC. */
   private void flushBatch(List<BatchItem> items) {
     if (items.isEmpty()) {
       return;
     }
 
-    if (items.size() == 1) {
-      flushSingle(items.get(0));
-      return;
-    }
-
-    flushMultiple(items);
-  }
-
-  /** Single-item optimization: use regular Enqueue RPC for exact error semantics. */
-  private void flushSingle(BatchItem item) {
-    Service.EnqueueRequest req =
-        Service.EnqueueRequest.newBuilder()
-            .setQueue(item.message.getQueue())
-            .putAllHeaders(item.message.getHeaders())
-            .setPayload(com.google.protobuf.ByteString.copyFrom(item.message.getPayload()))
-            .build();
-    try {
-      Service.EnqueueResponse resp = stub.enqueue(req);
-      item.future.complete(resp.getMessageId());
-    } catch (StatusRuntimeException e) {
-      item.future.completeExceptionally(FilaClient.mapEnqueueError(e));
-    }
-  }
-
-  /** Multi-item flush: use BatchEnqueue RPC for amortized overhead. */
-  private void flushMultiple(List<BatchItem> items) {
-    Service.BatchEnqueueRequest.Builder reqBuilder = Service.BatchEnqueueRequest.newBuilder();
+    Service.EnqueueRequest.Builder reqBuilder = Service.EnqueueRequest.newBuilder();
     for (BatchItem item : items) {
       reqBuilder.addMessages(
-          Service.EnqueueRequest.newBuilder()
+          Service.EnqueueMessage.newBuilder()
               .setQueue(item.message.getQueue())
               .putAllHeaders(item.message.getHeaders())
               .setPayload(com.google.protobuf.ByteString.copyFrom(item.message.getPayload()))
@@ -245,20 +217,19 @@ final class Batcher {
     }
 
     try {
-      Service.BatchEnqueueResponse resp = stub.batchEnqueue(reqBuilder.build());
-      List<Service.BatchEnqueueResult> results = resp.getResultsList();
+      Service.EnqueueResponse resp = stub.enqueue(reqBuilder.build());
+      List<Service.EnqueueResult> results = resp.getResultsList();
 
       for (int i = 0; i < items.size(); i++) {
         BatchItem item = items.get(i);
         if (i < results.size()) {
-          Service.BatchEnqueueResult result = results.get(i);
+          Service.EnqueueResult result = results.get(i);
           switch (result.getResultCase()) {
-            case SUCCESS:
-              item.future.complete(result.getSuccess().getMessageId());
+            case MESSAGE_ID:
+              item.future.complete(result.getMessageId());
               break;
             case ERROR:
-              item.future.completeExceptionally(
-                  new RpcException(io.grpc.Status.Code.INTERNAL, result.getError()));
+              item.future.completeExceptionally(mapEnqueueResultError(result.getError()));
               break;
             default:
               item.future.completeExceptionally(
@@ -273,11 +244,21 @@ final class Batcher {
         }
       }
     } catch (StatusRuntimeException e) {
-      FilaException mapped = FilaClient.mapBatchEnqueueError(e);
+      FilaException mapped = FilaClient.mapEnqueueError(e);
       for (BatchItem item : items) {
         item.future.completeExceptionally(mapped);
       }
     }
+  }
+
+  private static FilaException mapEnqueueResultError(Service.EnqueueError error) {
+    return switch (error.getCode()) {
+      case ENQUEUE_ERROR_CODE_QUEUE_NOT_FOUND ->
+          new QueueNotFoundException("enqueue: " + error.getMessage());
+      case ENQUEUE_ERROR_CODE_PERMISSION_DENIED ->
+          new RpcException(io.grpc.Status.Code.PERMISSION_DENIED, error.getMessage());
+      default -> new RpcException(io.grpc.Status.Code.INTERNAL, error.getMessage());
+    };
   }
 
   private static Thread newDaemon(Runnable r, String name) {

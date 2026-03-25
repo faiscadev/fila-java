@@ -3,10 +3,10 @@ package dev.faisca.fila;
 import java.util.Map;
 
 /**
- * A message to be enqueued via {@link FilaClient#batchEnqueue(java.util.List)}.
+ * A message to be enqueued via {@link FilaClient#enqueueMany(java.util.List)}.
  *
  * <p>Each message specifies its target queue, headers, and payload independently, allowing a single
- * batch to target multiple queues.
+ * call to target multiple queues.
  */
 public final class EnqueueMessage {
   private final String queue;

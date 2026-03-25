@@ -1,29 +1,29 @@
 package dev.faisca.fila;
 
 /**
- * The result of a single message within a batch enqueue call.
+ * The result of a single message within an enqueue call.
  *
- * <p>Each message in a batch is independently validated and processed. A failed message does not
- * affect the others. Use {@link #isSuccess()} to check the outcome, then either {@link
- * #getMessageId()} or {@link #getError()}.
+ * <p>Each message in a multi-message enqueue is independently validated and processed. A failed
+ * message does not affect the others. Use {@link #isSuccess()} to check the outcome, then either
+ * {@link #getMessageId()} or {@link #getError()}.
  */
-public final class BatchEnqueueResult {
+public final class EnqueueResult {
   private final String messageId;
   private final String error;
 
-  private BatchEnqueueResult(String messageId, String error) {
+  private EnqueueResult(String messageId, String error) {
     this.messageId = messageId;
     this.error = error;
   }
 
   /** Create a successful result with the broker-assigned message ID. */
-  static BatchEnqueueResult success(String messageId) {
-    return new BatchEnqueueResult(messageId, null);
+  static EnqueueResult success(String messageId) {
+    return new EnqueueResult(messageId, null);
   }
 
   /** Create a failed result with an error description. */
-  static BatchEnqueueResult error(String error) {
-    return new BatchEnqueueResult(null, error);
+  static EnqueueResult error(String error) {
+    return new EnqueueResult(null, error);
   }
 
   /** Returns true if the message was successfully enqueued. */

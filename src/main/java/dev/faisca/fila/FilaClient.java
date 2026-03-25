@@ -25,7 +25,7 @@ import java.util.function.Consumer;
 /**
  * Client for the Fila message broker.
  *
- * <p>Wraps the hot-path gRPC operations: enqueue, batch enqueue, consume, ack, nack.
+ * <p>Wraps the hot-path gRPC operations: enqueue, consume, ack, nack.
  *
  * <p>By default, {@code enqueue()} routes through an opportunistic batcher that coalesces messages
  * at high load without adding latency at low load. Use {@link Builder#withBatchMode(BatchMode)} to
@@ -112,23 +112,23 @@ public final class FilaClient implements AutoCloseable {
   }
 
   /**
-   * Enqueue a batch of messages in a single RPC call.
+   * Enqueue multiple messages in a single RPC call.
    *
    * <p>Each message is independently validated and processed. A failed message does not affect the
    * others in the batch. Returns a list of results with one entry per input message, in the same
    * order.
    *
-   * <p>This bypasses the batcher and always uses the {@code BatchEnqueue} RPC directly.
+   * <p>This bypasses the batcher and always uses the {@code Enqueue} RPC directly.
    *
    * @param messages the messages to enqueue
    * @return a list of results, one per input message
    * @throws RpcException for transport-level failures affecting the entire batch
    */
-  public List<BatchEnqueueResult> batchEnqueue(List<EnqueueMessage> messages) {
-    Service.BatchEnqueueRequest.Builder reqBuilder = Service.BatchEnqueueRequest.newBuilder();
+  public List<EnqueueResult> enqueueMany(List<EnqueueMessage> messages) {
+    Service.EnqueueRequest.Builder reqBuilder = Service.EnqueueRequest.newBuilder();
     for (EnqueueMessage msg : messages) {
       reqBuilder.addMessages(
-          Service.EnqueueRequest.newBuilder()
+          Service.EnqueueMessage.newBuilder()
               .setQueue(msg.getQueue())
               .putAllHeaders(msg.getHeaders())
               .setPayload(com.google.protobuf.ByteString.copyFrom(msg.getPayload()))
@@ -136,25 +136,25 @@ public final class FilaClient implements AutoCloseable {
     }
 
     try {
-      Service.BatchEnqueueResponse resp = blockingStub.batchEnqueue(reqBuilder.build());
-      List<Service.BatchEnqueueResult> protoResults = resp.getResultsList();
-      List<BatchEnqueueResult> results = new ArrayList<>(protoResults.size());
-      for (Service.BatchEnqueueResult r : protoResults) {
+      Service.EnqueueResponse resp = blockingStub.enqueue(reqBuilder.build());
+      List<Service.EnqueueResult> protoResults = resp.getResultsList();
+      List<EnqueueResult> results = new ArrayList<>(protoResults.size());
+      for (Service.EnqueueResult r : protoResults) {
         switch (r.getResultCase()) {
-          case SUCCESS:
-            results.add(BatchEnqueueResult.success(r.getSuccess().getMessageId()));
+          case MESSAGE_ID:
+            results.add(EnqueueResult.success(r.getMessageId()));
             break;
           case ERROR:
-            results.add(BatchEnqueueResult.error(r.getError()));
+            results.add(EnqueueResult.error(r.getError().getMessage()));
             break;
           default:
-            results.add(BatchEnqueueResult.error("no result from server"));
+            results.add(EnqueueResult.error("no result from server"));
             break;
         }
       }
       return results;
     } catch (StatusRuntimeException e) {
-      throw mapBatchEnqueueError(e);
+      throw mapEnqueueError(e);
     }
   }
 
@@ -162,8 +162,8 @@ public final class FilaClient implements AutoCloseable {
    * Open a streaming consumer on the specified queue.
    *
    * <p>Messages are delivered to the handler on a background thread. The handler transparently
-   * receives messages from both singular and batched server responses. Nacked messages are
-   * redelivered on the same stream. Call {@link ConsumerHandle#cancel()} to stop consuming.
+   * receives messages from batched server responses. Nacked messages are redelivered on the same
+   * stream. Call {@link ConsumerHandle#cancel()} to stop consuming.
    *
    * @param queue queue to consume from
    * @param handler callback invoked for each message
@@ -212,9 +212,23 @@ public final class FilaClient implements AutoCloseable {
    */
   public void ack(String queue, String msgId) {
     Service.AckRequest req =
-        Service.AckRequest.newBuilder().setQueue(queue).setMessageId(msgId).build();
+        Service.AckRequest.newBuilder()
+            .addMessages(
+                Service.AckMessage.newBuilder().setQueue(queue).setMessageId(msgId).build())
+            .build();
     try {
-      blockingStub.ack(req);
+      Service.AckResponse resp = blockingStub.ack(req);
+      List<Service.AckResult> results = resp.getResultsList();
+      if (results.size() != 1) {
+        throw new RpcException(io.grpc.Status.Code.INTERNAL, "no result from server");
+      }
+      Service.AckResult first = results.get(0);
+      if (first.getResultCase() == Service.AckResult.ResultCase.ERROR) {
+        throw mapAckResultError(first.getError());
+      }
+      if (first.getResultCase() == Service.AckResult.ResultCase.RESULT_NOT_SET) {
+        throw new RpcException(io.grpc.Status.Code.INTERNAL, "no result from server");
+      }
     } catch (StatusRuntimeException e) {
       throw mapAckError(e);
     }
@@ -232,12 +246,26 @@ public final class FilaClient implements AutoCloseable {
   public void nack(String queue, String msgId, String error) {
     Service.NackRequest req =
         Service.NackRequest.newBuilder()
-            .setQueue(queue)
-            .setMessageId(msgId)
-            .setError(error)
+            .addMessages(
+                Service.NackMessage.newBuilder()
+                    .setQueue(queue)
+                    .setMessageId(msgId)
+                    .setError(error)
+                    .build())
             .build();
     try {
-      blockingStub.nack(req);
+      Service.NackResponse resp = blockingStub.nack(req);
+      List<Service.NackResult> results = resp.getResultsList();
+      if (results.size() != 1) {
+        throw new RpcException(io.grpc.Status.Code.INTERNAL, "no result from server");
+      }
+      Service.NackResult first = results.get(0);
+      if (first.getResultCase() == Service.NackResult.ResultCase.ERROR) {
+        throw mapNackResultError(first.getError());
+      }
+      if (first.getResultCase() == Service.NackResult.ResultCase.RESULT_NOT_SET) {
+        throw new RpcException(io.grpc.Status.Code.INTERNAL, "no result from server");
+      }
     } catch (StatusRuntimeException e) {
       throw mapNackError(e);
     }
@@ -268,41 +296,45 @@ public final class FilaClient implements AutoCloseable {
   private String enqueueDirect(String queue, Map<String, String> headers, byte[] payload) {
     Service.EnqueueRequest req =
         Service.EnqueueRequest.newBuilder()
-            .setQueue(queue)
-            .putAllHeaders(headers)
-            .setPayload(com.google.protobuf.ByteString.copyFrom(payload))
+            .addMessages(
+                Service.EnqueueMessage.newBuilder()
+                    .setQueue(queue)
+                    .putAllHeaders(headers)
+                    .setPayload(com.google.protobuf.ByteString.copyFrom(payload))
+                    .build())
             .build();
     try {
       Service.EnqueueResponse resp = blockingStub.enqueue(req);
-      return resp.getMessageId();
+      List<Service.EnqueueResult> results = resp.getResultsList();
+      if (results.isEmpty()) {
+        throw new RpcException(io.grpc.Status.Code.INTERNAL, "no result from server");
+      }
+      Service.EnqueueResult first = results.get(0);
+      switch (first.getResultCase()) {
+        case MESSAGE_ID:
+          return first.getMessageId();
+        case ERROR:
+          throw mapEnqueueResultError(first.getError());
+        default:
+          throw new RpcException(io.grpc.Status.Code.INTERNAL, "no result from server");
+      }
     } catch (StatusRuntimeException e) {
       throw mapEnqueueError(e);
     }
   }
 
-  /**
-   * Consume a stream, unpacking both singular and batched responses into individual messages.
-   *
-   * <p>Prefers the batched {@code messages} field when non-empty, falling back to the singular
-   * {@code message} field for backward compatibility with older servers.
-   */
+  /** Consume a stream, unpacking batched responses into individual messages. */
   private static void consumeStream(
       Iterator<Service.ConsumeResponse> stream, Consumer<ConsumeMessage> handler) {
     while (stream.hasNext()) {
       Service.ConsumeResponse resp = stream.next();
 
-      // Prefer the batched messages field when non-empty.
-      List<Messages.Message> batchedMessages = resp.getMessagesList();
-      if (!batchedMessages.isEmpty()) {
-        for (Messages.Message msg : batchedMessages) {
-          if (msg.getId().isEmpty()) {
-            continue;
-          }
-          handler.accept(buildConsumeMessage(msg));
+      List<Messages.Message> messages = resp.getMessagesList();
+      for (Messages.Message msg : messages) {
+        if (msg.getId().isEmpty()) {
+          continue;
         }
-      } else if (resp.hasMessage() && !resp.getMessage().getId().isEmpty()) {
-        // Fall back to singular message for backward compatibility.
-        handler.accept(buildConsumeMessage(resp.getMessage()));
+        handler.accept(buildConsumeMessage(msg));
       }
     }
   }
@@ -411,11 +443,13 @@ public final class FilaClient implements AutoCloseable {
     };
   }
 
-  static FilaException mapBatchEnqueueError(StatusRuntimeException e) {
-    return switch (e.getStatus().getCode()) {
-      case NOT_FOUND ->
-          new QueueNotFoundException("batch enqueue: " + e.getStatus().getDescription());
-      default -> new RpcException(e.getStatus().getCode(), e.getStatus().getDescription());
+  private static FilaException mapEnqueueResultError(Service.EnqueueError error) {
+    return switch (error.getCode()) {
+      case ENQUEUE_ERROR_CODE_QUEUE_NOT_FOUND ->
+          new QueueNotFoundException("enqueue: " + error.getMessage());
+      case ENQUEUE_ERROR_CODE_PERMISSION_DENIED ->
+          new RpcException(io.grpc.Status.Code.PERMISSION_DENIED, error.getMessage());
+      default -> new RpcException(io.grpc.Status.Code.INTERNAL, error.getMessage());
     };
   }
 
@@ -433,10 +467,30 @@ public final class FilaClient implements AutoCloseable {
     };
   }
 
+  private static FilaException mapAckResultError(Service.AckError error) {
+    return switch (error.getCode()) {
+      case ACK_ERROR_CODE_MESSAGE_NOT_FOUND ->
+          new MessageNotFoundException("ack: " + error.getMessage());
+      case ACK_ERROR_CODE_PERMISSION_DENIED ->
+          new RpcException(io.grpc.Status.Code.PERMISSION_DENIED, error.getMessage());
+      default -> new RpcException(io.grpc.Status.Code.INTERNAL, error.getMessage());
+    };
+  }
+
   private static FilaException mapNackError(StatusRuntimeException e) {
     return switch (e.getStatus().getCode()) {
       case NOT_FOUND -> new MessageNotFoundException("nack: " + e.getStatus().getDescription());
       default -> new RpcException(e.getStatus().getCode(), e.getStatus().getDescription());
+    };
+  }
+
+  private static FilaException mapNackResultError(Service.NackError error) {
+    return switch (error.getCode()) {
+      case NACK_ERROR_CODE_MESSAGE_NOT_FOUND ->
+          new MessageNotFoundException("nack: " + error.getMessage());
+      case NACK_ERROR_CODE_PERMISSION_DENIED ->
+          new RpcException(io.grpc.Status.Code.PERMISSION_DENIED, error.getMessage());
+      default -> new RpcException(io.grpc.Status.Code.INTERNAL, error.getMessage());
     };
   }
 
