@@ -220,6 +220,8 @@ final class FibpConnection implements AutoCloseable {
     try {
       ackFuture.get(10, TimeUnit.SECONDS);
     } catch (java.util.concurrent.ExecutionException e) {
+      // Clean up both maps on failure so no stale entries remain.
+      pending.remove(corrId);
       pushHandlers.remove(corrId);
       Throwable cause = e.getCause();
       if (cause instanceof FilaException fe) {
@@ -227,7 +229,11 @@ final class FibpConnection implements AutoCloseable {
       }
       throw new FilaException("consume setup failed", cause);
     } catch (Exception e) {
+      pending.remove(corrId);
       pushHandlers.remove(corrId);
+      if (e instanceof InterruptedException) {
+        Thread.currentThread().interrupt();
+      }
       throw new FilaException("consume setup failed", e);
     }
     return corrId;
@@ -321,11 +327,17 @@ final class FibpConnection implements AutoCloseable {
       return;
     }
 
-    // Stream push frame: route to registered push handler
+    // Stream push frame: route to registered push handler.
+    // Guard against exceptions from the handler — they must not kill the reader thread
+    // and strand all other pending requests.
     if ((flags & FLAG_STREAM) != 0) {
       PushHandler ph = pushHandlers.get(corrId);
       if (ph != null) {
-        ph.handler.accept(payload);
+        try {
+          ph.handler.accept(payload);
+        } catch (Exception e) {
+          // Push handler threw — log and continue reading; do not crash the reader.
+        }
       }
       return;
     }

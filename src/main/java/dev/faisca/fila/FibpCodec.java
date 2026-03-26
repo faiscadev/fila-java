@@ -70,7 +70,11 @@ final class FibpCodec {
       writeStr16(dos, queue);
       dos.writeShort(messages.size());
       for (EnqueueMessage msg : messages) {
-        dos.writeByte(msg.getHeaders().size());
+        int headerCount = msg.getHeaders().size();
+        if (headerCount > 255) {
+          throw new FilaException("too many headers: " + headerCount + " exceeds maximum of 255");
+        }
+        dos.writeByte(headerCount);
         for (Map.Entry<String, String> entry : msg.getHeaders().entrySet()) {
           writeStr16(dos, entry.getKey());
           writeStr16(dos, entry.getValue());
@@ -308,6 +312,10 @@ final class FibpCodec {
 
   private static void writeStr16(DataOutputStream dos, String s) throws IOException {
     byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
+    if (bytes.length > 65535) {
+      throw new FilaException(
+          "string too long: " + bytes.length + " bytes exceeds u16 maximum of 65535");
+    }
     dos.writeShort(bytes.length);
     dos.write(bytes);
   }

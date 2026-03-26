@@ -85,8 +85,16 @@ final class TestServer {
     // Use the FIBP admin protocol to create queues.
     String host = address.split(":")[0];
     int port = Integer.parseInt(address.split(":")[1]);
-    try (FibpAdminClient admin = FibpAdminClient.connect(host, port, key)) {
-      admin.createQueue(name);
+    try {
+      FibpAdminClient admin;
+      if (tlsEnabled && caCertPem != null) {
+        admin = FibpAdminClient.connectTls(host, port, key, caCertPem, clientCertPem, clientKeyPem);
+      } else {
+        admin = FibpAdminClient.connect(host, port, key);
+      }
+      try (admin) {
+        admin.createQueue(name);
+      }
     } catch (IOException e) {
       throw new RuntimeException("failed to create queue '" + name + "'", e);
     }

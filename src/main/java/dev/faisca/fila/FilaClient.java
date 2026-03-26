@@ -109,6 +109,19 @@ public final class FilaClient implements AutoCloseable {
     if (messages.isEmpty()) {
       return new ArrayList<>();
     }
+    // FIBP enqueue frames encode a single queue name at the request level.
+    // All messages in one enqueueMany call must target the same queue.
+    String queue = messages.get(0).getQueue();
+    for (int i = 1; i < messages.size(); i++) {
+      if (!messages.get(i).getQueue().equals(queue)) {
+        throw new IllegalArgumentException(
+            "enqueueMany: all messages must target the same queue — got \""
+                + queue
+                + "\" and \""
+                + messages.get(i).getQueue()
+                + "\"");
+      }
+    }
     byte[] reqPayload = FibpCodec.encodeEnqueue(messages);
     byte[] respPayload = sendSync(conn.sendRequest(FibpConnection.OP_ENQUEUE, reqPayload));
     return FibpCodec.decodeEnqueueResponse(respPayload);

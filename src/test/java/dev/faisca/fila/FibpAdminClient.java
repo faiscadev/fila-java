@@ -1,12 +1,20 @@
 package dev.faisca.fila;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.security.KeyStore;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
 import java.util.Arrays;
+import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.TrustManagerFactory;
 
 /**
  * Minimal FIBP admin client for test infrastructure.
@@ -14,6 +22,8 @@ import java.util.Arrays;
  * <p>Supports CreateQueue only. Admin operation payloads are protobuf-encoded (matching the
  * server's fila-core admin dispatch). We hand-roll the minimal protobuf needed to avoid a test
  * dependency on a protobuf runtime.
+ *
+ * <p>Supports both plaintext and TLS/mTLS connections.
  */
 final class FibpAdminClient implements AutoCloseable {
 
@@ -32,8 +42,61 @@ final class FibpAdminClient implements AutoCloseable {
     this.out = out;
   }
 
+  /** Connect plaintext (no TLS). */
   static FibpAdminClient connect(String host, int port, String apiKey) throws IOException {
     Socket sock = new Socket(host, port);
+    return init(sock, apiKey);
+  }
+
+  /**
+   * Connect with TLS using a custom CA certificate and optional client cert/key for mTLS.
+   *
+   * @param caCertPem PEM-encoded CA certificate (required)
+   * @param clientCertPem PEM-encoded client certificate (optional, for mTLS)
+   * @param clientKeyPem PEM-encoded client private key (optional, for mTLS)
+   */
+  static FibpAdminClient connectTls(
+      String host,
+      int port,
+      String apiKey,
+      byte[] caCertPem,
+      byte[] clientCertPem,
+      byte[] clientKeyPem)
+      throws IOException {
+    try {
+      CertificateFactory cf = CertificateFactory.getInstance("X.509");
+      X509Certificate caCert =
+          (X509Certificate) cf.generateCertificate(new ByteArrayInputStream(caCertPem));
+
+      KeyStore trustStore = KeyStore.getInstance(KeyStore.getDefaultType());
+      trustStore.load(null, null);
+      trustStore.setCertificateEntry("fila-ca", caCert);
+
+      TrustManagerFactory tmf =
+          TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+      tmf.init(trustStore);
+
+      SSLContext sslContext = SSLContext.getInstance("TLS");
+
+      if (clientCertPem != null && clientKeyPem != null) {
+        KeyManagerFactory kmf = buildKeyManagerFactory(clientCertPem, clientKeyPem);
+        sslContext.init(kmf.getKeyManagers(), tmf.getTrustManagers(), null);
+      } else {
+        sslContext.init(null, tmf.getTrustManagers(), null);
+      }
+
+      SSLSocket sslSocket = (SSLSocket) sslContext.getSocketFactory().createSocket(host, port);
+      sslSocket.setUseClientMode(true);
+      sslSocket.startHandshake();
+      return init(sslSocket, apiKey);
+    } catch (IOException e) {
+      throw e;
+    } catch (Exception e) {
+      throw new IOException("TLS admin connection failed", e);
+    }
+  }
+
+  private static FibpAdminClient init(Socket sock, String apiKey) throws IOException {
     sock.setTcpNoDelay(true);
     DataInputStream in = new DataInputStream(sock.getInputStream());
     DataOutputStream out = new DataOutputStream(sock.getOutputStream());
@@ -92,6 +155,40 @@ final class FibpAdminClient implements AutoCloseable {
     buf.write(value);
   }
 
+  private static KeyManagerFactory buildKeyManagerFactory(byte[] certPem, byte[] keyPem)
+      throws Exception {
+    CertificateFactory cf = CertificateFactory.getInstance("X.509");
+    java.security.cert.Certificate cert = cf.generateCertificate(new ByteArrayInputStream(certPem));
+
+    String keyStr = new String(keyPem, StandardCharsets.UTF_8);
+    String keyBase64 =
+        keyStr
+            .replaceAll("-----BEGIN.*?-----", "")
+            .replaceAll("-----END.*?-----", "")
+            .replaceAll("\\s", "");
+    byte[] keyBytes = java.util.Base64.getDecoder().decode(keyBase64);
+
+    java.security.PrivateKey privateKey;
+    java.security.KeyFactory kf;
+    try {
+      kf = java.security.KeyFactory.getInstance("EC");
+      privateKey = kf.generatePrivate(new java.security.spec.PKCS8EncodedKeySpec(keyBytes));
+    } catch (Exception e) {
+      kf = java.security.KeyFactory.getInstance("RSA");
+      privateKey = kf.generatePrivate(new java.security.spec.PKCS8EncodedKeySpec(keyBytes));
+    }
+
+    KeyStore ks = KeyStore.getInstance("PKCS12");
+    ks.load(null, null);
+    char[] emptyPassword = new char[0];
+    ks.setKeyEntry(
+        "client", privateKey, emptyPassword, new java.security.cert.Certificate[] {cert});
+
+    KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+    kmf.init(ks, emptyPassword);
+    return kmf;
+  }
+
   private byte[] sendRequest(byte op, byte[] payload) throws IOException {
     int corrId;
     synchronized (writeLock) {
@@ -110,16 +207,15 @@ final class FibpAdminClient implements AutoCloseable {
     if (bodyLen < FRAME_HEADER_BYTES) {
       throw new IOException("malformed response frame: bodyLen=" + bodyLen);
     }
-    in.readByte(); // flags (unused)
+    in.readByte(); // flags (not used in single-threaded client)
     byte respOp = in.readByte();
-    in.readInt(); // respCorrId (unused in this single-threaded client)
+    in.readInt(); // corrId (not used in single-threaded client)
     int respPayloadLen = bodyLen - FRAME_HEADER_BYTES;
     byte[] respPayload = new byte[respPayloadLen];
     if (respPayloadLen > 0) {
       in.readFully(respPayload);
     }
 
-    // flags and respCorrId are not used in this simple blocking client
     if (respOp == FibpConnection.OP_ERROR) {
       String msg = new String(respPayload, StandardCharsets.UTF_8);
       throw new IOException("server error: " + msg);

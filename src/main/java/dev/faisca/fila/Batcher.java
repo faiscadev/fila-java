@@ -241,8 +241,14 @@ final class Batcher {
       for (BatchItem item : items) {
         item.future.completeExceptionally(mapped);
       }
-    } catch (Exception e) {
-      FilaException mapped = mapException(e);
+    } catch (java.util.concurrent.TimeoutException e) {
+      FilaException mapped = new RpcException(RpcException.Code.UNAVAILABLE, "enqueue timed out");
+      for (BatchItem item : items) {
+        item.future.completeExceptionally(mapped);
+      }
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      FilaException mapped = new RpcException(RpcException.Code.UNAVAILABLE, "enqueue interrupted");
       for (BatchItem item : items) {
         item.future.completeExceptionally(mapped);
       }
@@ -253,7 +259,7 @@ final class Batcher {
     if (t instanceof FilaException fe) {
       return fe;
     }
-    return new RpcException(RpcException.Code.INTERNAL, t.getMessage());
+    return new RpcException(RpcException.Code.INTERNAL, t != null ? t.getMessage() : "unknown");
   }
 
   private static Thread newDaemon(Runnable r, String name) {
