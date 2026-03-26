@@ -1,20 +1,23 @@
 package dev.faisca.fila;
 
-import io.grpc.Context;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Handle for a running consume stream. Call {@link #cancel()} to stop consuming. */
 public final class ConsumerHandle {
-  private final Context.CancellableContext context;
+  private final AtomicBoolean cancelled;
   private final Thread thread;
+  private final Runnable onCancel;
 
-  ConsumerHandle(Context.CancellableContext context, Thread thread) {
-    this.context = context;
+  ConsumerHandle(AtomicBoolean cancelled, Thread thread, Runnable onCancel) {
+    this.cancelled = cancelled;
     this.thread = thread;
+    this.onCancel = onCancel;
   }
 
   /** Cancel the consume stream and wait for the consumer thread to finish. */
   public void cancel() {
-    context.cancel(null);
+    cancelled.set(true);
+    onCancel.run();
     try {
       thread.join(5000);
     } catch (InterruptedException e) {

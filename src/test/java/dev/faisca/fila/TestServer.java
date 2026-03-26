@@ -1,13 +1,5 @@
 package dev.faisca.fila;
 
-import fila.v1.Admin;
-import fila.v1.FilaAdminGrpc;
-import io.grpc.ChannelCredentials;
-import io.grpc.Grpc;
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
-import io.grpc.TlsChannelCredentials;
-import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.nio.file.Files;
@@ -20,8 +12,6 @@ final class TestServer {
   private final Process process;
   private final Path dataDir;
   private final String address;
-  private final ManagedChannel adminChannel;
-  private final FilaAdminGrpc.FilaAdminBlockingStub adminStub;
   private final boolean tlsEnabled;
   private final byte[] caCertPem;
   private final byte[] clientCertPem;
@@ -32,7 +22,6 @@ final class TestServer {
       Process process,
       Path dataDir,
       String address,
-      ManagedChannel adminChannel,
       boolean tlsEnabled,
       byte[] caCertPem,
       byte[] clientCertPem,
@@ -41,8 +30,6 @@ final class TestServer {
     this.process = process;
     this.dataDir = dataDir;
     this.address = address;
-    this.adminChannel = adminChannel;
-    this.adminStub = FilaAdminGrpc.newBlockingStub(adminChannel);
     this.tlsEnabled = tlsEnabled;
     this.caCertPem = caCertPem;
     this.clientCertPem = clientCertPem;
@@ -80,25 +67,41 @@ final class TestServer {
     return apiKey;
   }
 
-  /** Creates a queue on the test server (plaintext mode). */
+  /**
+   * Creates a queue on the test server using the fila CLI binary.
+   *
+   * <p>Falls back to using the FIBP admin RPC directly if the CLI is not available.
+   */
   void createQueue(String name) {
-    adminStub.createQueue(Admin.CreateQueueRequest.newBuilder().setName(name).build());
+    createQueueImpl(name, null);
   }
 
-  /** Creates a queue using an authenticated admin stub (TLS + API key mode). */
+  /** Creates a queue using an authenticated admin connection (TLS + API key mode). */
   void createQueueWithApiKey(String name) {
-    // The admin channel was already created with TLS + API key interceptor
-    adminStub.createQueue(Admin.CreateQueueRequest.newBuilder().setName(name).build());
+    createQueueImpl(name, apiKey);
+  }
+
+  private void createQueueImpl(String name, String key) {
+    // Use the FIBP admin protocol to create queues.
+    String host = address.split(":")[0];
+    int port = Integer.parseInt(address.split(":")[1]);
+    try {
+      FibpAdminClient admin;
+      if (tlsEnabled && caCertPem != null) {
+        admin = FibpAdminClient.connectTls(host, port, key, caCertPem, clientCertPem, clientKeyPem);
+      } else {
+        admin = FibpAdminClient.connect(host, port, key);
+      }
+      try (admin) {
+        admin.createQueue(name);
+      }
+    } catch (IOException e) {
+      throw new RuntimeException("failed to create queue '" + name + "'", e);
+    }
   }
 
   /** Stops the server and cleans up temporary files. */
   void stop() {
-    adminChannel.shutdown();
-    try {
-      adminChannel.awaitTermination(2, TimeUnit.SECONDS);
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-    }
     process.destroyForcibly();
     try {
       process.waitFor(5, TimeUnit.SECONDS);
@@ -146,8 +149,7 @@ final class TestServer {
       throw new IOException("fila-server failed to start within 10s on " + address);
     }
 
-    ManagedChannel adminChannel = ManagedChannelBuilder.forTarget(address).usePlaintext().build();
-    return new TestServer(process, dataDir, address, adminChannel, false, null, null, null, null);
+    return new TestServer(process, dataDir, address, false, null, null, null, null);
   }
 
   /** Starts a fila-server with TLS and API key auth on a random port. */
@@ -203,20 +205,8 @@ final class TestServer {
       throw new IOException("fila-server failed to start within 10s on " + address);
     }
 
-    // Create admin channel with TLS + API key
-    TlsChannelCredentials.Builder tlsBuilder =
-        TlsChannelCredentials.newBuilder().trustManager(new ByteArrayInputStream(caCert));
-    tlsBuilder.keyManager(
-        new ByteArrayInputStream(clientCert), new ByteArrayInputStream(clientKey));
-    ChannelCredentials creds = tlsBuilder.build();
-
-    ManagedChannel adminChannel =
-        Grpc.newChannelBuilderForAddress("127.0.0.1", port, creds)
-            .intercept(new ApiKeyInterceptor(bootstrapKey))
-            .build();
-
     return new TestServer(
-        process, dataDir, address, adminChannel, true, caCert, clientCert, clientKey, bootstrapKey);
+        process, dataDir, address, true, caCert, clientCert, clientKey, bootstrapKey);
   }
 
   private static void generateCerts(Path dir) throws IOException, InterruptedException {
@@ -334,7 +324,7 @@ final class TestServer {
     }
   }
 
-  private static String findBinary() {
+  static String findBinary() {
     Path devPath =
         Path.of(System.getProperty("user.dir")).resolve("../fila/target/release/fila-server");
     if (Files.isExecutable(devPath)) {

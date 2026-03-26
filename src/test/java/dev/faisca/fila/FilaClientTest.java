@@ -10,8 +10,20 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIf;
 
+/**
+ * Integration tests for FilaClient core operations.
+ *
+ * <p>Requires a fila-server binary. Skipped if not available.
+ */
+@EnabledIf("serverAvailable")
 class FilaClientTest {
+
+  static boolean serverAvailable() {
+    return TestServer.isBinaryAvailable();
+  }
+
   private static TestServer server;
   private static FilaClient client;
 
