@@ -252,6 +252,13 @@ final class Batcher {
       for (BatchItem item : items) {
         item.future.completeExceptionally(mapped);
       }
+    } catch (RuntimeException e) {
+      // Guard against unexpected failures (e.g. decodeEnqueueResponse errors) so all per-item
+      // futures are resolved and callers are not left blocked indefinitely.
+      FilaException mapped = mapException(e);
+      for (BatchItem item : items) {
+        item.future.completeExceptionally(mapped);
+      }
     }
   }
 
