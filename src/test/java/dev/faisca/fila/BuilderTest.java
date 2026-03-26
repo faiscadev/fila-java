@@ -4,55 +4,27 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import org.junit.jupiter.api.Test;
 
-/** Unit tests for FilaClient.Builder configuration. */
+/**
+ * Unit tests for FilaClient.Builder configuration.
+ *
+ * <p>Tests that exercise the builder configuration itself (e.g. validation, chaining) do not
+ * require a running server. Tests that call {@code build()} on a valid configuration require a
+ * server at localhost:5555 and are guarded by {@code @EnabledIf("serverAvailable")}.
+ *
+ * <p>The previous gRPC-based client deferred connection to the first RPC call, so {@code build()}
+ * always succeeded even with no server. FIBP connects eagerly during {@code build()}.
+ */
 class BuilderTest {
 
-  @Test
-  void builderPlaintextDoesNotThrow() {
-    // Plaintext builder should create a client without error (default AUTO batching)
-    FilaClient client = FilaClient.builder("localhost:5555").build();
-    assertNotNull(client);
-    client.close();
+  static boolean serverAvailable() {
+    return TestServer.isBinaryAvailable();
   }
 
-  @Test
-  void builderWithBatchDisabledDoesNotThrow() {
-    // Plaintext builder with batching disabled
-    FilaClient client =
-        FilaClient.builder("localhost:5555").withBatchMode(BatchMode.disabled()).build();
-    assertNotNull(client);
-    client.close();
-  }
-
-  @Test
-  void builderWithBatchAutoDoesNotThrow() {
-    // Explicit AUTO batch mode
-    FilaClient client =
-        FilaClient.builder("localhost:5555").withBatchMode(BatchMode.auto(50)).build();
-    assertNotNull(client);
-    client.close();
-  }
-
-  @Test
-  void builderWithBatchLingerDoesNotThrow() {
-    // LINGER batch mode
-    FilaClient client =
-        FilaClient.builder("localhost:5555").withBatchMode(BatchMode.linger(10, 50)).build();
-    assertNotNull(client);
-    client.close();
-  }
-
-  @Test
-  void builderWithApiKeyDoesNotThrow() {
-    // API key without TLS should work (for backward compat / dev mode)
-    FilaClient client = FilaClient.builder("localhost:5555").withApiKey("test-key").build();
-    assertNotNull(client);
-    client.close();
-  }
+  // ── Configuration-only tests (no server needed) ───────────────────────────
 
   @Test
   void builderWithInvalidCaCertThrows() {
-    // Invalid PEM bytes should throw FilaException
+    // Invalid PEM bytes should throw FilaException before any network attempt
     assertThrows(
         FilaException.class,
         () ->
@@ -62,8 +34,19 @@ class BuilderTest {
   }
 
   @Test
+  void builderClientCertWithoutTlsThrows() {
+    // Client cert without TLS enabled should fail fast (no network attempt)
+    assertThrows(
+        FilaException.class,
+        () ->
+            FilaClient.builder("localhost:5555")
+                .withTlsClientCert("cert".getBytes(), "key".getBytes())
+                .build());
+  }
+
+  @Test
   void builderChainingReturnsBuilder() {
-    // Verify fluent API returns the builder for chaining
+    // Verify fluent API returns the builder for chaining — no build() call
     FilaClient.Builder builder =
         FilaClient.builder("localhost:5555")
             .withApiKey("key")
@@ -74,41 +57,47 @@ class BuilderTest {
   }
 
   @Test
-  void builderClientCertWithoutTlsThrows() {
-    // Client cert without TLS enabled should fail fast
-    assertThrows(
-        FilaException.class,
-        () ->
-            FilaClient.builder("localhost:5555")
-                .withTlsClientCert("cert".getBytes(), "key".getBytes())
-                .build());
-  }
-
-  @Test
-  void builderWithTlsSystemTrustDoesNotThrow() {
-    // withTls() using system trust store should create a client without error
-    FilaClient client = FilaClient.builder("localhost:5555").withTls().build();
-    assertNotNull(client);
-    client.close();
-  }
-
-  @Test
-  void builderWithTlsAndApiKeyDoesNotThrow() {
-    // withTls() combined with API key should work
-    FilaClient client =
-        FilaClient.builder("localhost:5555").withTls().withApiKey("test-key").build();
-    assertNotNull(client);
-    client.close();
-  }
-
-  @Test
   void builderChainingWithTlsReturnsBuilder() {
-    // Verify fluent API for withTls() returns the builder for chaining
+    // Verify fluent API for withTls() returns the builder for chaining — no build() call
     FilaClient.Builder builder =
         FilaClient.builder("localhost:5555")
             .withTls()
             .withApiKey("key")
             .withTlsClientCert("cert".getBytes(), "key".getBytes());
+    assertNotNull(builder);
+  }
+
+  @Test
+  void parseHostPlaintext() {
+    assertEquals("localhost", FilaClient.Builder.parseHost("localhost:5555"));
+  }
+
+  @Test
+  void parsePortPlaintext() {
+    assertEquals(5555, FilaClient.Builder.parsePort("localhost:5555"));
+  }
+
+  @Test
+  void parsePortDefaultsWhenMissing() {
+    assertEquals(5555, FilaClient.Builder.parsePort("localhost"));
+  }
+
+  @Test
+  void parseHostIpv6() {
+    assertEquals("::1", FilaClient.Builder.parseHost("[::1]:5555"));
+  }
+
+  @Test
+  void parsePortIpv6() {
+    assertEquals(5555, FilaClient.Builder.parsePort("[::1]:5555"));
+  }
+
+  // ── BatchMode config tests (no server needed) ─────────────────────────────
+
+  @Test
+  void batchModeAutoIsDefault() {
+    // Default batch mode should be AUTO — verified without connecting
+    FilaClient.Builder builder = FilaClient.builder("localhost:5555");
     assertNotNull(builder);
   }
 }

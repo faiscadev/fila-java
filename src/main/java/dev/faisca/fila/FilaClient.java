@@ -1,31 +1,27 @@
 package dev.faisca.fila;
 
-import fila.v1.FilaServiceGrpc;
-import fila.v1.Messages;
-import fila.v1.Service;
-import io.grpc.ChannelCredentials;
-import io.grpc.Context;
-import io.grpc.Grpc;
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
-import io.grpc.Metadata;
-import io.grpc.StatusRuntimeException;
-import io.grpc.TlsChannelCredentials;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.security.KeyStore;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
 import java.util.ArrayList;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.TrustManagerFactory;
 
 /**
  * Client for the Fila message broker.
  *
- * <p>Wraps the hot-path gRPC operations: enqueue, consume, ack, nack.
+ * <p>Uses the FIBP (Fila Binary Protocol) transport over raw TCP or TLS.
  *
  * <p>By default, {@code enqueue()} routes through an opportunistic batcher that coalesces messages
  * at high load without adding latency at low load. Use {@link Builder#withBatchMode(BatchMode)} to
@@ -44,30 +40,12 @@ import java.util.function.Consumer;
  * }</pre>
  */
 public final class FilaClient implements AutoCloseable {
-  private static final Metadata.Key<String> LEADER_ADDR_KEY =
-      Metadata.Key.of("x-fila-leader-addr", Metadata.ASCII_STRING_MARSHALLER);
 
-  private final ManagedChannel channel;
-  private final FilaServiceGrpc.FilaServiceBlockingStub blockingStub;
-  private final byte[] caCertPem;
-  private final byte[] clientCertPem;
-  private final byte[] clientKeyPem;
-  private final String apiKey;
+  private final FibpConnection conn;
   private final Batcher batcher;
 
-  private FilaClient(
-      ManagedChannel channel,
-      byte[] caCertPem,
-      byte[] clientCertPem,
-      byte[] clientKeyPem,
-      String apiKey,
-      Batcher batcher) {
-    this.channel = channel;
-    this.blockingStub = FilaServiceGrpc.newBlockingStub(channel);
-    this.caCertPem = caCertPem;
-    this.clientCertPem = clientCertPem;
-    this.clientKeyPem = clientKeyPem;
-    this.apiKey = apiKey;
+  private FilaClient(FibpConnection conn, Batcher batcher) {
+    this.conn = conn;
     this.batcher = batcher;
   }
 
@@ -88,23 +66,25 @@ public final class FilaClient implements AutoCloseable {
    * @param payload message payload bytes
    * @return the broker-assigned message ID (UUIDv7)
    * @throws QueueNotFoundException if the queue does not exist
-   * @throws RpcException for unexpected gRPC failures
+   * @throws RpcException for unexpected transport failures
    */
   public String enqueue(String queue, Map<String, String> headers, byte[] payload) {
     if (batcher != null) {
       CompletableFuture<String> future =
           batcher.submit(new EnqueueMessage(queue, headers, payload));
       try {
-        return future.get();
+        return future.get(30, TimeUnit.SECONDS);
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
         throw new FilaException("enqueue interrupted", e);
       } catch (ExecutionException e) {
         Throwable cause = e.getCause();
-        if (cause instanceof FilaException) {
-          throw (FilaException) cause;
+        if (cause instanceof FilaException fe) {
+          throw fe;
         }
-        throw new RpcException(io.grpc.Status.Code.INTERNAL, cause.getMessage());
+        throw new RpcException(RpcException.Code.INTERNAL, cause.getMessage());
+      } catch (TimeoutException e) {
+        throw new RpcException(RpcException.Code.UNAVAILABLE, "enqueue timed out");
       }
     }
 
@@ -112,94 +92,104 @@ public final class FilaClient implements AutoCloseable {
   }
 
   /**
-   * Enqueue multiple messages in a single RPC call.
+   * Enqueue multiple messages in a single FIBP frame.
    *
    * <p>Each message is independently validated and processed. A failed message does not affect the
    * others in the batch. Returns a list of results with one entry per input message, in the same
    * order.
    *
-   * <p>This bypasses the batcher and always uses the {@code Enqueue} RPC directly.
+   * <p>This bypasses the batcher and always sends a FIBP ENQUEUE frame directly. All messages must
+   * target the same queue (the first message's queue name is used).
    *
    * @param messages the messages to enqueue
    * @return a list of results, one per input message
    * @throws RpcException for transport-level failures affecting the entire batch
    */
   public List<EnqueueResult> enqueueMany(List<EnqueueMessage> messages) {
-    Service.EnqueueRequest.Builder reqBuilder = Service.EnqueueRequest.newBuilder();
-    for (EnqueueMessage msg : messages) {
-      reqBuilder.addMessages(
-          Service.EnqueueMessage.newBuilder()
-              .setQueue(msg.getQueue())
-              .putAllHeaders(msg.getHeaders())
-              .setPayload(com.google.protobuf.ByteString.copyFrom(msg.getPayload()))
-              .build());
+    if (messages.isEmpty()) {
+      return new ArrayList<>();
     }
-
-    try {
-      Service.EnqueueResponse resp = blockingStub.enqueue(reqBuilder.build());
-      List<Service.EnqueueResult> protoResults = resp.getResultsList();
-      List<EnqueueResult> results = new ArrayList<>(protoResults.size());
-      for (Service.EnqueueResult r : protoResults) {
-        switch (r.getResultCase()) {
-          case MESSAGE_ID:
-            results.add(EnqueueResult.success(r.getMessageId()));
-            break;
-          case ERROR:
-            results.add(EnqueueResult.error(r.getError().getMessage()));
-            break;
-          default:
-            results.add(EnqueueResult.error("no result from server"));
-            break;
-        }
-      }
-      return results;
-    } catch (StatusRuntimeException e) {
-      throw mapEnqueueError(e);
-    }
+    byte[] reqPayload = FibpCodec.encodeEnqueue(messages);
+    byte[] respPayload = sendSync(conn.sendRequest(FibpConnection.OP_ENQUEUE, reqPayload));
+    return FibpCodec.decodeEnqueueResponse(respPayload);
   }
 
   /**
    * Open a streaming consumer on the specified queue.
    *
-   * <p>Messages are delivered to the handler on a background thread. The handler transparently
-   * receives messages from batched server responses. Nacked messages are redelivered on the same
-   * stream. Call {@link ConsumerHandle#cancel()} to stop consuming.
+   * <p>Messages are delivered to the handler on a background thread. Nacked messages are
+   * redelivered on the same stream. Call {@link ConsumerHandle#cancel()} to stop consuming.
    *
    * @param queue queue to consume from
    * @param handler callback invoked for each message
    * @return a handle to cancel the consumer
    * @throws QueueNotFoundException if the queue does not exist
-   * @throws RpcException for unexpected gRPC failures
+   * @throws RpcException for unexpected transport failures
    */
   public ConsumerHandle consume(String queue, Consumer<ConsumeMessage> handler) {
-    Service.ConsumeRequest req = Service.ConsumeRequest.newBuilder().setQueue(queue).build();
+    AtomicBoolean cancelled = new AtomicBoolean(false);
 
-    Context.CancellableContext ctx = Context.current().withCancellation();
+    byte[] reqPayload = FibpCodec.encodeConsume(queue, 64);
+
+    // sendConsumeRequest registers the push handler atomically before writing the frame,
+    // waits for the initial server ACK (verifies queue exists), and returns the corr_id.
+    int corrId;
+    try {
+      corrId =
+          conn.sendConsumeRequest(
+              reqPayload,
+              queue,
+              pushPayload -> {
+                if (cancelled.get()) {
+                  return;
+                }
+                try {
+                  List<ConsumeMessage> msgs = FibpCodec.decodePushBatch(pushPayload, queue);
+                  for (ConsumeMessage msg : msgs) {
+                    if (!msg.getId().isEmpty()) {
+                      handler.accept(msg);
+                    }
+                  }
+                } catch (Exception e) {
+                  // Decode error — skip this batch and continue consuming.
+                }
+              });
+    } catch (IOException e) {
+      throw new FilaException("consume: failed to send request", e);
+    } catch (RuntimeException e) {
+      // Unwrap FilaException from sendConsumeRequest's RuntimeException wrapper
+      if (e.getCause() instanceof FilaException fe) {
+        throw fe;
+      }
+      throw e;
+    }
+
+    int consumeCorrId = corrId;
     Thread thread =
         new Thread(
             () -> {
-              ctx.run(
-                  () -> {
-                    try {
-                      Iterator<Service.ConsumeResponse> stream = blockingStub.consume(req);
-                      consumeStream(stream, handler);
-                    } catch (StatusRuntimeException e) {
-                      if (e.getStatus().getCode() == io.grpc.Status.Code.CANCELLED) {
-                        return;
-                      }
-                      String leaderAddr = extractLeaderAddr(e);
-                      if (leaderAddr != null) {
-                        retryOnLeader(leaderAddr, req, handler);
-                      } else {
-                        throw mapConsumeError(e);
-                      }
-                    }
-                  });
+              // This thread keeps the consumer alive until cancelled or connection closes.
+              // All message delivery happens on the FIBP reader thread via the push handler.
+              while (!cancelled.get() && !conn.isClosed()) {
+                try {
+                  Thread.sleep(100);
+                } catch (InterruptedException e) {
+                  Thread.currentThread().interrupt();
+                  return;
+                }
+              }
             },
             "fila-consumer-" + queue);
     thread.setDaemon(true);
     thread.start();
-    return new ConsumerHandle(ctx, thread);
+
+    return new ConsumerHandle(
+        cancelled,
+        thread,
+        () -> {
+          conn.unregisterPushHandler(consumeCorrId);
+          thread.interrupt();
+        });
   }
 
   /**
@@ -208,30 +198,12 @@ public final class FilaClient implements AutoCloseable {
    * @param queue queue the message belongs to
    * @param msgId ID of the message to acknowledge
    * @throws MessageNotFoundException if the message does not exist
-   * @throws RpcException for unexpected gRPC failures
+   * @throws RpcException for unexpected transport failures
    */
   public void ack(String queue, String msgId) {
-    Service.AckRequest req =
-        Service.AckRequest.newBuilder()
-            .addMessages(
-                Service.AckMessage.newBuilder().setQueue(queue).setMessageId(msgId).build())
-            .build();
-    try {
-      Service.AckResponse resp = blockingStub.ack(req);
-      List<Service.AckResult> results = resp.getResultsList();
-      if (results.size() != 1) {
-        throw new RpcException(io.grpc.Status.Code.INTERNAL, "no result from server");
-      }
-      Service.AckResult first = results.get(0);
-      if (first.getResultCase() == Service.AckResult.ResultCase.ERROR) {
-        throw mapAckResultError(first.getError());
-      }
-      if (first.getResultCase() == Service.AckResult.ResultCase.RESULT_NOT_SET) {
-        throw new RpcException(io.grpc.Status.Code.INTERNAL, "no result from server");
-      }
-    } catch (StatusRuntimeException e) {
-      throw mapAckError(e);
-    }
+    byte[] reqPayload = FibpCodec.encodeAck(queue, msgId);
+    byte[] respPayload = sendSync(conn.sendRequest(FibpConnection.OP_ACK, reqPayload));
+    FibpCodec.decodeAckNackResponse(respPayload, true);
   }
 
   /**
@@ -241,258 +213,63 @@ public final class FilaClient implements AutoCloseable {
    * @param msgId ID of the message to nack
    * @param error description of the failure
    * @throws MessageNotFoundException if the message does not exist
-   * @throws RpcException for unexpected gRPC failures
+   * @throws RpcException for unexpected transport failures
    */
   public void nack(String queue, String msgId, String error) {
-    Service.NackRequest req =
-        Service.NackRequest.newBuilder()
-            .addMessages(
-                Service.NackMessage.newBuilder()
-                    .setQueue(queue)
-                    .setMessageId(msgId)
-                    .setError(error)
-                    .build())
-            .build();
-    try {
-      Service.NackResponse resp = blockingStub.nack(req);
-      List<Service.NackResult> results = resp.getResultsList();
-      if (results.size() != 1) {
-        throw new RpcException(io.grpc.Status.Code.INTERNAL, "no result from server");
-      }
-      Service.NackResult first = results.get(0);
-      if (first.getResultCase() == Service.NackResult.ResultCase.ERROR) {
-        throw mapNackResultError(first.getError());
-      }
-      if (first.getResultCase() == Service.NackResult.ResultCase.RESULT_NOT_SET) {
-        throw new RpcException(io.grpc.Status.Code.INTERNAL, "no result from server");
-      }
-    } catch (StatusRuntimeException e) {
-      throw mapNackError(e);
-    }
+    byte[] reqPayload = FibpCodec.encodeNack(queue, msgId, error);
+    byte[] respPayload = sendSync(conn.sendRequest(FibpConnection.OP_NACK, reqPayload));
+    FibpCodec.decodeAckNackResponse(respPayload, false);
   }
 
   /**
    * Shut down the client, draining any pending batched messages before disconnecting.
    *
-   * <p>If a batcher is running, pending messages are flushed before the gRPC channel is closed.
+   * <p>If a batcher is running, pending messages are flushed before the FIBP connection is closed.
    */
   @Override
   public void close() {
     if (batcher != null) {
       batcher.shutdown();
     }
-    channel.shutdown();
-    try {
-      if (!channel.awaitTermination(5, TimeUnit.SECONDS)) {
-        channel.shutdownNow();
-      }
-    } catch (InterruptedException e) {
-      channel.shutdownNow();
-      Thread.currentThread().interrupt();
-    }
+    conn.close();
   }
 
-  /** Direct single-message enqueue RPC (no batcher). */
+  // ── Private helpers ───────────────────────────────────────────────────────
+
   private String enqueueDirect(String queue, Map<String, String> headers, byte[] payload) {
-    Service.EnqueueRequest req =
-        Service.EnqueueRequest.newBuilder()
-            .addMessages(
-                Service.EnqueueMessage.newBuilder()
-                    .setQueue(queue)
-                    .putAllHeaders(headers)
-                    .setPayload(com.google.protobuf.ByteString.copyFrom(payload))
-                    .build())
-            .build();
+    List<EnqueueMessage> messages = List.of(new EnqueueMessage(queue, headers, payload));
+    byte[] reqPayload = FibpCodec.encodeEnqueue(messages);
+    byte[] respPayload = sendSync(conn.sendRequest(FibpConnection.OP_ENQUEUE, reqPayload));
+    List<EnqueueResult> results = FibpCodec.decodeEnqueueResponse(respPayload);
+    if (results.isEmpty()) {
+      throw new RpcException(RpcException.Code.INTERNAL, "no result from server");
+    }
+    EnqueueResult first = results.get(0);
+    if (first.isSuccess()) {
+      return first.getMessageId();
+    }
+    throw new QueueNotFoundException(first.getError());
+  }
+
+  /** Block on a response future with a 30s timeout, unwrapping exceptions. */
+  private static byte[] sendSync(CompletableFuture<byte[]> future) {
     try {
-      Service.EnqueueResponse resp = blockingStub.enqueue(req);
-      List<Service.EnqueueResult> results = resp.getResultsList();
-      if (results.isEmpty()) {
-        throw new RpcException(io.grpc.Status.Code.INTERNAL, "no result from server");
+      return future.get(30, TimeUnit.SECONDS);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new FilaException("request interrupted", e);
+    } catch (ExecutionException e) {
+      Throwable cause = e.getCause();
+      if (cause instanceof FilaException fe) {
+        throw fe;
       }
-      Service.EnqueueResult first = results.get(0);
-      switch (first.getResultCase()) {
-        case MESSAGE_ID:
-          return first.getMessageId();
-        case ERROR:
-          throw mapEnqueueResultError(first.getError());
-        default:
-          throw new RpcException(io.grpc.Status.Code.INTERNAL, "no result from server");
-      }
-    } catch (StatusRuntimeException e) {
-      throw mapEnqueueError(e);
+      throw new RpcException(RpcException.Code.INTERNAL, cause.getMessage());
+    } catch (TimeoutException e) {
+      throw new RpcException(RpcException.Code.UNAVAILABLE, "request timed out");
     }
   }
 
-  /** Consume a stream, unpacking batched responses into individual messages. */
-  private static void consumeStream(
-      Iterator<Service.ConsumeResponse> stream, Consumer<ConsumeMessage> handler) {
-    while (stream.hasNext()) {
-      Service.ConsumeResponse resp = stream.next();
-
-      List<Messages.Message> messages = resp.getMessagesList();
-      for (Messages.Message msg : messages) {
-        if (msg.getId().isEmpty()) {
-          continue;
-        }
-        handler.accept(buildConsumeMessage(msg));
-      }
-    }
-  }
-
-  private static String extractLeaderAddr(StatusRuntimeException e) {
-    if (e.getStatus().getCode() != io.grpc.Status.Code.UNAVAILABLE) {
-      return null;
-    }
-    Metadata trailers = e.getTrailers();
-    if (trailers == null) {
-      return null;
-    }
-    return trailers.get(LEADER_ADDR_KEY);
-  }
-
-  private static void validateLeaderAddr(String addr) {
-    if (addr == null || addr.isEmpty()) {
-      throw new FilaException("invalid leader address: empty");
-    }
-    // Must not contain scheme (e.g. "http://") or path (e.g. "/foo")
-    if (addr.contains("//") || addr.contains("/")) {
-      throw new FilaException("invalid leader address: must be host:port, got: " + addr);
-    }
-    int colonIdx = addr.lastIndexOf(':');
-    if (colonIdx < 0) {
-      throw new FilaException("invalid leader address: missing port, got: " + addr);
-    }
-    String host = addr.substring(0, colonIdx);
-    String portStr = addr.substring(colonIdx + 1);
-    if (host.isEmpty()) {
-      throw new FilaException("invalid leader address: empty host, got: " + addr);
-    }
-    int port;
-    try {
-      port = Integer.parseInt(portStr);
-    } catch (NumberFormatException ex) {
-      throw new FilaException("invalid leader address: non-numeric port, got: " + addr);
-    }
-    if (port < 1 || port > 65535) {
-      throw new FilaException("invalid leader address: port out of range, got: " + addr);
-    }
-  }
-
-  private void retryOnLeader(
-      String leaderAddr, Service.ConsumeRequest req, Consumer<ConsumeMessage> handler) {
-    validateLeaderAddr(leaderAddr);
-    ManagedChannel leaderChannel = buildChannel(leaderAddr);
-    try {
-      FilaServiceGrpc.FilaServiceBlockingStub leaderStub =
-          FilaServiceGrpc.newBlockingStub(leaderChannel);
-      Iterator<Service.ConsumeResponse> stream = leaderStub.consume(req);
-      consumeStream(stream, handler);
-    } catch (StatusRuntimeException e) {
-      if (e.getStatus().getCode() != io.grpc.Status.Code.CANCELLED) {
-        throw mapConsumeError(e);
-      }
-    } finally {
-      leaderChannel.shutdown();
-    }
-  }
-
-  private ManagedChannel buildChannel(String address) {
-    if (caCertPem != null) {
-      try {
-        TlsChannelCredentials.Builder tlsBuilder =
-            TlsChannelCredentials.newBuilder().trustManager(new ByteArrayInputStream(caCertPem));
-        if (clientCertPem != null && clientKeyPem != null) {
-          tlsBuilder.keyManager(
-              new ByteArrayInputStream(clientCertPem), new ByteArrayInputStream(clientKeyPem));
-        }
-        ChannelCredentials creds = tlsBuilder.build();
-        var channelBuilder =
-            Grpc.newChannelBuilderForAddress(
-                Builder.parseHost(address), Builder.parsePort(address), creds);
-        if (apiKey != null) {
-          channelBuilder.intercept(new ApiKeyInterceptor(apiKey));
-        }
-        return channelBuilder.build();
-      } catch (IOException e) {
-        throw new FilaException("failed to configure TLS for leader redirect", e);
-      }
-    } else {
-      var channelBuilder = ManagedChannelBuilder.forTarget(address).usePlaintext();
-      if (apiKey != null) {
-        channelBuilder.intercept(new ApiKeyInterceptor(apiKey));
-      }
-      return channelBuilder.build();
-    }
-  }
-
-  private static ConsumeMessage buildConsumeMessage(Messages.Message msg) {
-    Messages.MessageMetadata meta = msg.getMetadata();
-    return new ConsumeMessage(
-        msg.getId(),
-        msg.getHeadersMap(),
-        msg.getPayload().toByteArray(),
-        meta.getFairnessKey(),
-        meta.getAttemptCount(),
-        meta.getQueueId());
-  }
-
-  static FilaException mapEnqueueError(StatusRuntimeException e) {
-    return switch (e.getStatus().getCode()) {
-      case NOT_FOUND -> new QueueNotFoundException("enqueue: " + e.getStatus().getDescription());
-      default -> new RpcException(e.getStatus().getCode(), e.getStatus().getDescription());
-    };
-  }
-
-  private static FilaException mapEnqueueResultError(Service.EnqueueError error) {
-    return switch (error.getCode()) {
-      case ENQUEUE_ERROR_CODE_QUEUE_NOT_FOUND ->
-          new QueueNotFoundException("enqueue: " + error.getMessage());
-      case ENQUEUE_ERROR_CODE_PERMISSION_DENIED ->
-          new RpcException(io.grpc.Status.Code.PERMISSION_DENIED, error.getMessage());
-      default -> new RpcException(io.grpc.Status.Code.INTERNAL, error.getMessage());
-    };
-  }
-
-  private static FilaException mapConsumeError(StatusRuntimeException e) {
-    return switch (e.getStatus().getCode()) {
-      case NOT_FOUND -> new QueueNotFoundException("consume: " + e.getStatus().getDescription());
-      default -> new RpcException(e.getStatus().getCode(), e.getStatus().getDescription());
-    };
-  }
-
-  private static FilaException mapAckError(StatusRuntimeException e) {
-    return switch (e.getStatus().getCode()) {
-      case NOT_FOUND -> new MessageNotFoundException("ack: " + e.getStatus().getDescription());
-      default -> new RpcException(e.getStatus().getCode(), e.getStatus().getDescription());
-    };
-  }
-
-  private static FilaException mapAckResultError(Service.AckError error) {
-    return switch (error.getCode()) {
-      case ACK_ERROR_CODE_MESSAGE_NOT_FOUND ->
-          new MessageNotFoundException("ack: " + error.getMessage());
-      case ACK_ERROR_CODE_PERMISSION_DENIED ->
-          new RpcException(io.grpc.Status.Code.PERMISSION_DENIED, error.getMessage());
-      default -> new RpcException(io.grpc.Status.Code.INTERNAL, error.getMessage());
-    };
-  }
-
-  private static FilaException mapNackError(StatusRuntimeException e) {
-    return switch (e.getStatus().getCode()) {
-      case NOT_FOUND -> new MessageNotFoundException("nack: " + e.getStatus().getDescription());
-      default -> new RpcException(e.getStatus().getCode(), e.getStatus().getDescription());
-    };
-  }
-
-  private static FilaException mapNackResultError(Service.NackError error) {
-    return switch (error.getCode()) {
-      case NACK_ERROR_CODE_MESSAGE_NOT_FOUND ->
-          new MessageNotFoundException("nack: " + error.getMessage());
-      case NACK_ERROR_CODE_PERMISSION_DENIED ->
-          new RpcException(io.grpc.Status.Code.PERMISSION_DENIED, error.getMessage());
-      default -> new RpcException(io.grpc.Status.Code.INTERNAL, error.getMessage());
-    };
-  }
+  // ── Builder ───────────────────────────────────────────────────────────────
 
   /** Builder for {@link FilaClient}. */
   public static final class Builder {
@@ -556,8 +333,7 @@ public final class FilaClient implements AutoCloseable {
     /**
      * Set an API key for authentication.
      *
-     * <p>When set, the key is sent as a {@code Bearer} token in the {@code authorization} metadata
-     * header on every outgoing RPC.
+     * <p>When set, the key is sent in an AUTH frame during the FIBP handshake.
      *
      * @param apiKey the API key string
      * @return this builder
@@ -588,63 +364,122 @@ public final class FilaClient implements AutoCloseable {
             "client certificate requires TLS — call withTls() or withTlsCaCert() first");
       }
 
-      ManagedChannel channel;
+      String host = parseHost(address);
+      int port = parsePort(address);
 
-      if (tlsEnabled) {
-        // Parse host/port before the TLS try block so that NumberFormatException
-        // (a subclass of IllegalArgumentException) from address parsing is not
-        // misreported as "invalid certificate".
-        String host = parseHost(address);
-        int port = parsePort(address);
-
-        try {
-          TlsChannelCredentials.Builder tlsBuilder = TlsChannelCredentials.newBuilder();
-
-          if (caCertPem != null) {
-            tlsBuilder.trustManager(new ByteArrayInputStream(caCertPem));
-          }
-
-          if (clientCertPem != null && clientKeyPem != null) {
-            tlsBuilder.keyManager(
-                new ByteArrayInputStream(clientCertPem), new ByteArrayInputStream(clientKeyPem));
-          }
-
-          ChannelCredentials creds = tlsBuilder.build();
-          var channelBuilder = Grpc.newChannelBuilderForAddress(host, port, creds);
-
-          if (apiKey != null) {
-            channelBuilder.intercept(new ApiKeyInterceptor(apiKey));
-          }
-
-          channel = channelBuilder.build();
-        } catch (IllegalArgumentException e) {
-          throw new FilaException("failed to configure TLS: invalid certificate", e);
-        } catch (IOException e) {
-          throw new FilaException("failed to configure TLS", e);
+      FibpConnection conn;
+      try {
+        if (tlsEnabled) {
+          SSLSocket sslSocket = buildSslSocket(host, port);
+          conn = FibpConnection.connectTls(sslSocket, apiKey);
+        } else {
+          conn = FibpConnection.connect(host, port, apiKey);
         }
-      } else {
-        var channelBuilder = ManagedChannelBuilder.forTarget(address).usePlaintext();
-
-        if (apiKey != null) {
-          channelBuilder.intercept(new ApiKeyInterceptor(apiKey));
-        }
-
-        channel = channelBuilder.build();
+      } catch (FilaException e) {
+        throw e;
+      } catch (IOException e) {
+        throw new FilaException("failed to connect to " + address, e);
+      } catch (Exception e) {
+        throw new FilaException("failed to configure connection", e);
       }
 
       Batcher batcherInstance = null;
       if (batchMode.getKind() != BatchMode.Kind.DISABLED) {
-        FilaServiceGrpc.FilaServiceBlockingStub batcherStub =
-            FilaServiceGrpc.newBlockingStub(channel);
-        if (apiKey != null) {
-          // The stub needs the interceptor applied at channel level (already done above).
-          // No additional interceptor needed on the stub.
-        }
-        batcherInstance = new Batcher(batcherStub, batchMode);
+        batcherInstance = new Batcher(conn, batchMode);
       }
 
-      return new FilaClient(
-          channel, caCertPem, clientCertPem, clientKeyPem, apiKey, batcherInstance);
+      return new FilaClient(conn, batcherInstance);
+    }
+
+    private SSLSocket buildSslSocket(String host, int port) throws Exception {
+      SSLContext sslContext;
+
+      if (caCertPem != null) {
+        // Custom CA certificate
+        CertificateFactory cf = CertificateFactory.getInstance("X.509");
+        X509Certificate caCert;
+        try {
+          caCert = (X509Certificate) cf.generateCertificate(new ByteArrayInputStream(caCertPem));
+        } catch (Exception e) {
+          throw new FilaException("failed to configure TLS: invalid certificate", e);
+        }
+
+        KeyStore trustStore = KeyStore.getInstance(KeyStore.getDefaultType());
+        trustStore.load(null, null);
+        trustStore.setCertificateEntry("fila-ca", caCert);
+
+        TrustManagerFactory tmf =
+            TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+        tmf.init(trustStore);
+
+        sslContext = SSLContext.getInstance("TLS");
+
+        if (clientCertPem != null && clientKeyPem != null) {
+          // mTLS: load client cert + key via PKCS12 round-trip
+          javax.net.ssl.KeyManagerFactory kmf = buildKeyManagerFactory(clientCertPem, clientKeyPem);
+          sslContext.init(kmf.getKeyManagers(), tmf.getTrustManagers(), null);
+        } else {
+          sslContext.init(null, tmf.getTrustManagers(), null);
+        }
+      } else {
+        // System trust store
+        sslContext = SSLContext.getInstance("TLS");
+        if (clientCertPem != null && clientKeyPem != null) {
+          javax.net.ssl.KeyManagerFactory kmf = buildKeyManagerFactory(clientCertPem, clientKeyPem);
+          sslContext.init(kmf.getKeyManagers(), null, null);
+        } else {
+          sslContext.init(null, null, null);
+        }
+      }
+
+      SSLSocket sock = (SSLSocket) sslContext.getSocketFactory().createSocket(host, port);
+      sock.setUseClientMode(true);
+      return sock;
+    }
+
+    /**
+     * Build a {@link javax.net.ssl.KeyManagerFactory} from PEM-encoded certificate and PKCS#8 key
+     * bytes by constructing an in-memory PKCS#12 keystore.
+     */
+    private static javax.net.ssl.KeyManagerFactory buildKeyManagerFactory(
+        byte[] certPem, byte[] keyPem) throws Exception {
+      // Parse the certificate
+      CertificateFactory cf = CertificateFactory.getInstance("X.509");
+      java.security.cert.Certificate cert =
+          cf.generateCertificate(new ByteArrayInputStream(certPem));
+
+      // Parse the private key — strip PEM headers and decode Base64
+      String keyStr = new String(keyPem, java.nio.charset.StandardCharsets.UTF_8);
+      String keyBase64 =
+          keyStr
+              .replaceAll("-----BEGIN.*?-----", "")
+              .replaceAll("-----END.*?-----", "")
+              .replaceAll("\\s", "");
+      byte[] keyBytes = java.util.Base64.getDecoder().decode(keyBase64);
+
+      java.security.PrivateKey privateKey;
+      // Try EC first, then RSA
+      java.security.KeyFactory kf;
+      try {
+        kf = java.security.KeyFactory.getInstance("EC");
+        privateKey = kf.generatePrivate(new java.security.spec.PKCS8EncodedKeySpec(keyBytes));
+      } catch (Exception e) {
+        kf = java.security.KeyFactory.getInstance("RSA");
+        privateKey = kf.generatePrivate(new java.security.spec.PKCS8EncodedKeySpec(keyBytes));
+      }
+
+      // Build an in-memory PKCS12 keystore
+      KeyStore ks = KeyStore.getInstance("PKCS12");
+      ks.load(null, null);
+      char[] emptyPassword = new char[0];
+      ks.setKeyEntry(
+          "client", privateKey, emptyPassword, new java.security.cert.Certificate[] {cert});
+
+      javax.net.ssl.KeyManagerFactory kmf =
+          javax.net.ssl.KeyManagerFactory.getInstance(
+              javax.net.ssl.KeyManagerFactory.getDefaultAlgorithm());
+      kmf.init(ks, emptyPassword);
+      return kmf;
     }
 
     static String parseHost(String address) {
