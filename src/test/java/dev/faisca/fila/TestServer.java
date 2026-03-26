@@ -135,7 +135,7 @@ final class TestServer {
 
     Path dataDir = Files.createTempDirectory("fila-test-");
     Path configFile = dataDir.resolve("fila.toml");
-    Files.writeString(configFile, "[server]\nlisten_addr = \"" + address + "\"\n");
+    Files.writeString(configFile, "[fibp]\nlisten_addr = \"" + address + "\"\n");
 
     String binaryPath = findBinary();
     ProcessBuilder pb = new ProcessBuilder(binaryPath).redirectErrorStream(true);
@@ -171,7 +171,7 @@ final class TestServer {
 
     Path configFile = dataDir.resolve("fila.toml");
     String config =
-        "[server]\n"
+        "[fibp]\n"
             + "listen_addr = \""
             + address
             + "\"\n"
