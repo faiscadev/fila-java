@@ -137,8 +137,12 @@ final class FibpAdminClient implements AutoCloseable {
    * <p>Wire format: queue_len:u16 + queue:utf8 + on_enqueue_len:u16 + on_enqueue:utf8 +
    * on_failure_len:u16 + on_failure:utf8 + visibility_timeout_ms:u32
    */
-  private static byte[] encodeCreateQueueRequest(String name) {
+  private static byte[] encodeCreateQueueRequest(String name) throws IOException {
     byte[] nameBytes = name.getBytes(StandardCharsets.UTF_8);
+    if (nameBytes.length > 0xFFFF) {
+      throw new IOException(
+          "queue name too long: UTF-8 length " + nameBytes.length + " exceeds u16 max (65535)");
+    }
     ByteArrayOutputStream buf = new ByteArrayOutputStream();
     writeU16(buf, nameBytes.length);
     buf.write(nameBytes, 0, nameBytes.length);
