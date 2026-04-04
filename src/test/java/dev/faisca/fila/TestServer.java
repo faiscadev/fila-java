@@ -1,27 +1,23 @@
 package dev.faisca.fila;
 
-import fila.v1.Admin;
-import fila.v1.FilaAdminGrpc;
-import io.grpc.ChannelCredentials;
-import io.grpc.Grpc;
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
-import io.grpc.TlsChannelCredentials;
-import java.io.ByteArrayInputStream;
+import dev.faisca.fila.fibp.Codec;
+import dev.faisca.fila.fibp.Connection;
+import dev.faisca.fila.fibp.Opcodes;
+import dev.faisca.fila.fibp.Primitives;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Comparator;
 import java.util.concurrent.TimeUnit;
+import javax.net.ssl.SSLContext;
 
 /** Manages a fila-server subprocess for integration tests. */
 final class TestServer {
   private final Process process;
   private final Path dataDir;
   private final String address;
-  private final ManagedChannel adminChannel;
-  private final FilaAdminGrpc.FilaAdminBlockingStub adminStub;
+  private final Connection adminConn;
   private final boolean tlsEnabled;
   private final byte[] caCertPem;
   private final byte[] clientCertPem;
@@ -32,7 +28,7 @@ final class TestServer {
       Process process,
       Path dataDir,
       String address,
-      ManagedChannel adminChannel,
+      Connection adminConn,
       boolean tlsEnabled,
       byte[] caCertPem,
       byte[] clientCertPem,
@@ -41,8 +37,7 @@ final class TestServer {
     this.process = process;
     this.dataDir = dataDir;
     this.address = address;
-    this.adminChannel = adminChannel;
-    this.adminStub = FilaAdminGrpc.newBlockingStub(adminChannel);
+    this.adminConn = adminConn;
     this.tlsEnabled = tlsEnabled;
     this.caCertPem = caCertPem;
     this.clientCertPem = clientCertPem;
@@ -50,55 +45,64 @@ final class TestServer {
     this.apiKey = apiKey;
   }
 
-  /** Returns the address of the running server. */
   String address() {
     return address;
   }
 
-  /** Returns true if TLS is enabled on this server. */
   boolean isTlsEnabled() {
     return tlsEnabled;
   }
 
-  /** Returns the CA certificate PEM bytes. Only valid when TLS is enabled. */
   byte[] caCertPem() {
     return caCertPem;
   }
 
-  /** Returns the client certificate PEM bytes. Only valid when TLS is enabled. */
   byte[] clientCertPem() {
     return clientCertPem;
   }
 
-  /** Returns the client private key PEM bytes. Only valid when TLS is enabled. */
   byte[] clientKeyPem() {
     return clientKeyPem;
   }
 
-  /** Returns the bootstrap API key. Only valid when auth is enabled. */
   String apiKey() {
     return apiKey;
   }
 
-  /** Creates a queue on the test server (plaintext mode). */
+  /** Creates a queue on the test server via FIBP. */
   void createQueue(String name) {
-    adminStub.createQueue(Admin.CreateQueueRequest.newBuilder().setName(name).build());
-  }
-
-  /** Creates a queue using an authenticated admin stub (TLS + API key mode). */
-  void createQueueWithApiKey(String name) {
-    // The admin channel was already created with TLS + API key interceptor
-    adminStub.createQueue(Admin.CreateQueueRequest.newBuilder().setName(name).build());
-  }
-
-  /** Stops the server and cleans up temporary files. */
-  void stop() {
-    adminChannel.shutdown();
+    int requestId = adminConn.nextRequestId();
+    byte[] frame = Codec.encodeCreateQueue(requestId, name, null, null, 0);
     try {
-      adminChannel.awaitTermination(2, TimeUnit.SECONDS);
+      Connection.Frame response = adminConn.sendAndReceive(frame, requestId, 10_000);
+      if (response.header().opcode() == Opcodes.ERROR) {
+        Primitives.Reader r = new Primitives.Reader(response.body());
+        int code = r.readU8();
+        String msg = r.readString();
+        throw new RuntimeException("createQueue failed: code=" + code + " msg=" + msg);
+      }
+      if (response.header().opcode() == Opcodes.CREATE_QUEUE_RESULT) {
+        Primitives.Reader r = new Primitives.Reader(response.body());
+        int code = r.readU8();
+        if (code != Opcodes.ERR_OK && code != Opcodes.ERR_QUEUE_ALREADY_EXISTS) {
+          throw new RuntimeException("createQueue failed: code=" + code);
+        }
+      }
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
+      throw new RuntimeException("createQueue failed", e);
+    } catch (IOException e) {
+      throw new RuntimeException("createQueue failed", e);
     }
+  }
+
+  /** Creates a queue using an authenticated admin connection (TLS + API key mode). */
+  void createQueueWithApiKey(String name) {
+    createQueue(name);
+  }
+
+  void stop() {
+    adminConn.close();
     process.destroyForcibly();
     try {
       process.waitFor(5, TimeUnit.SECONDS);
@@ -108,14 +112,6 @@ final class TestServer {
     deleteDirectory(dataDir);
   }
 
-  /**
-   * Returns true if the fila-server binary is available at a known local path.
-   *
-   * <p>Note: This intentionally does NOT check PATH. The TLS integration tests require a local dev
-   * build to ensure cert generation and server config are compatible. In CI, the plaintext
-   * integration tests run via {@link FilaClientTest} using the downloaded binary; the TLS tests are
-   * skipped until the CI pipeline is configured to provision TLS test infrastructure.
-   */
   static boolean isBinaryAvailable() {
     try {
       String path = findBinary();
@@ -140,14 +136,13 @@ final class TestServer {
     pb.environment().put("FILA_DATA_DIR", dataDir.resolve("db").toString());
     Process process = pb.start();
 
-    if (!waitForPort(port, 10_000)) {
+    Connection adminConn = waitForHandshake("127.0.0.1", port, null, null, 10_000);
+    if (adminConn == null) {
       process.destroyForcibly();
       deleteDirectory(dataDir);
       throw new IOException("fila-server failed to start within 10s on " + address);
     }
-
-    ManagedChannel adminChannel = ManagedChannelBuilder.forTarget(address).usePlaintext().build();
-    return new TestServer(process, dataDir, address, adminChannel, false, null, null, null, null);
+    return new TestServer(process, dataDir, address, adminConn, false, null, null, null, null);
   }
 
   /** Starts a fila-server with TLS and API key auth on a random port. */
@@ -157,14 +152,12 @@ final class TestServer {
 
     Path dataDir = Files.createTempDirectory("fila-test-tls-");
 
-    // Generate self-signed CA, server cert, and client cert using openssl
     generateCerts(dataDir);
 
     byte[] caCert = Files.readAllBytes(dataDir.resolve("ca.pem"));
     byte[] clientCert = Files.readAllBytes(dataDir.resolve("client.pem"));
     byte[] clientKey = Files.readAllBytes(dataDir.resolve("client-key.pem"));
 
-    // Bootstrap API key for auth
     String bootstrapKey = "test-bootstrap-key-" + System.currentTimeMillis();
 
     Path configFile = dataDir.resolve("fila.toml");
@@ -175,14 +168,14 @@ final class TestServer {
             + "\"\n"
             + "\n"
             + "[tls]\n"
-            + "ca_cert = \""
-            + dataDir.resolve("ca.pem")
-            + "\"\n"
-            + "server_cert = \""
+            + "cert_file = \""
             + dataDir.resolve("server.pem")
             + "\"\n"
-            + "server_key = \""
+            + "key_file = \""
             + dataDir.resolve("server-key.pem")
+            + "\"\n"
+            + "ca_file = \""
+            + dataDir.resolve("ca.pem")
             + "\"\n"
             + "\n"
             + "[auth]\n"
@@ -197,30 +190,19 @@ final class TestServer {
     pb.environment().put("FILA_DATA_DIR", dataDir.resolve("db").toString());
     Process process = pb.start();
 
-    if (!waitForPort(port, 10_000)) {
+    SSLContext sslContext = FilaClient.Builder.buildSSLContext(caCert, clientCert, clientKey);
+    Connection adminConn = waitForHandshake("127.0.0.1", port, bootstrapKey, sslContext, 10_000);
+    if (adminConn == null) {
       process.destroyForcibly();
       deleteDirectory(dataDir);
       throw new IOException("fila-server failed to start within 10s on " + address);
     }
 
-    // Create admin channel with TLS + API key
-    TlsChannelCredentials.Builder tlsBuilder =
-        TlsChannelCredentials.newBuilder().trustManager(new ByteArrayInputStream(caCert));
-    tlsBuilder.keyManager(
-        new ByteArrayInputStream(clientCert), new ByteArrayInputStream(clientKey));
-    ChannelCredentials creds = tlsBuilder.build();
-
-    ManagedChannel adminChannel =
-        Grpc.newChannelBuilderForAddress("127.0.0.1", port, creds)
-            .intercept(new ApiKeyInterceptor(bootstrapKey))
-            .build();
-
     return new TestServer(
-        process, dataDir, address, adminChannel, true, caCert, clientCert, clientKey, bootstrapKey);
+        process, dataDir, address, adminConn, true, caCert, clientCert, clientKey, bootstrapKey);
   }
 
   private static void generateCerts(Path dir) throws IOException, InterruptedException {
-    // Generate CA key and cert
     exec(
         dir,
         "openssl",
@@ -240,7 +222,6 @@ final class TestServer {
         "-subj",
         "/CN=fila-test-ca");
 
-    // Generate server key and CSR
     exec(
         dir,
         "openssl",
@@ -257,11 +238,9 @@ final class TestServer {
         "-subj",
         "/CN=127.0.0.1");
 
-    // Write SAN extension file
     Files.writeString(
         dir.resolve("server-ext.cnf"), "subjectAltName=IP:127.0.0.1\nbasicConstraints=CA:FALSE\n");
 
-    // Sign server cert with CA
     exec(
         dir,
         "openssl",
@@ -281,7 +260,6 @@ final class TestServer {
         "-extfile",
         "server-ext.cnf");
 
-    // Generate client key and CSR
     exec(
         dir,
         "openssl",
@@ -291,14 +269,25 @@ final class TestServer {
         "-pkeyopt",
         "ec_paramgen_curve:prime256v1",
         "-keyout",
-        "client-key.pem",
+        "client-key-ec.pem",
         "-out",
         "client.csr",
         "-nodes",
         "-subj",
         "/CN=fila-test-client");
 
-    // Sign client cert with CA
+    // Convert EC key to PKCS#8 format for Java compatibility
+    exec(
+        dir,
+        "openssl",
+        "pkcs8",
+        "-topk8",
+        "-nocrypt",
+        "-in",
+        "client-key-ec.pem",
+        "-out",
+        "client-key.pem");
+
     exec(
         dir,
         "openssl",
@@ -354,16 +343,23 @@ final class TestServer {
     }
   }
 
-  private static boolean waitForPort(int port, long timeoutMs) throws InterruptedException {
+  /**
+   * Wait for the server to accept a FIBP handshake, retrying up to timeoutMs.
+   *
+   * @return a connected Connection, or null if timed out
+   */
+  private static Connection waitForHandshake(
+      String host, int port, String apiKey, SSLContext sslContext, long timeoutMs)
+      throws InterruptedException {
     long deadline = System.currentTimeMillis() + timeoutMs;
     while (System.currentTimeMillis() < deadline) {
-      try (var sock = new java.net.Socket("127.0.0.1", port)) {
-        return true;
+      try {
+        return Connection.connect(host, port, apiKey, sslContext);
       } catch (IOException e) {
-        Thread.sleep(100);
+        Thread.sleep(200);
       }
     }
-    return false;
+    return null;
   }
 
   private static void deleteDirectory(Path dir) {

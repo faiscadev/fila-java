@@ -1,18 +1,16 @@
 package dev.faisca.fila;
 
-import io.grpc.Status;
-
-/** Thrown for unexpected gRPC failures not mapped to a specific Fila exception. */
+/** Thrown for protocol-level failures not mapped to a specific Fila exception. */
 public class RpcException extends FilaException {
-  private final Status.Code code;
+  private final int errorCode;
 
-  public RpcException(Status.Code code, String message) {
+  public RpcException(int errorCode, String message) {
     super(message);
-    this.code = code;
+    this.errorCode = errorCode;
   }
 
-  /** Returns the gRPC status code of the failed call. */
-  public Status.Code getCode() {
-    return code;
+  /** Returns the FIBP error code of the failed call. */
+  public int getErrorCode() {
+    return errorCode;
   }
 }

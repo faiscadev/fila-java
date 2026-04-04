@@ -3,12 +3,11 @@ plugins {
     id 'maven-publish'
     id 'signing'
     id 'io.github.gradle-nexus.publish-plugin' version '2.0.0'
-    id 'com.google.protobuf' version '0.9.4'
     id 'com.diffplug.spotless' version '7.0.2'
 }
 
 group = 'dev.faisca'
-version = '0.1.0'
+version = '0.3.0'
 
 java {
     sourceCompatibility = JavaVersion.VERSION_17
@@ -21,45 +20,10 @@ repositories {
     mavenCentral()
 }
 
-def grpcVersion = '1.71.0'
-def protobufVersion = '4.29.3'
-
 dependencies {
-    api "io.grpc:grpc-stub:${grpcVersion}"
-    api "io.grpc:grpc-protobuf:${grpcVersion}"
-
-    implementation "io.grpc:grpc-netty-shaded:${grpcVersion}"
-    implementation "com.google.protobuf:protobuf-java:${protobufVersion}"
-
-    compileOnly 'org.apache.tomcat:annotations-api:6.0.53'
-
     testImplementation platform('org.junit:junit-bom:5.11.4')
     testImplementation 'org.junit.jupiter:junit-jupiter'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
-}
-
-protobuf {
-    protoc {
-        artifact = "com.google.protobuf:protoc:${protobufVersion}"
-    }
-    plugins {
-        grpc {
-            artifact = "io.grpc:protoc-gen-grpc-java:${grpcVersion}"
-        }
-    }
-    generateProtoTasks {
-        all()*.plugins {
-            grpc {}
-        }
-    }
-}
-
-sourceSets {
-    main {
-        proto {
-            srcDir 'proto'
-        }
-    }
 }
 
 test {
