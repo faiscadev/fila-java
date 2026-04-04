@@ -95,8 +95,7 @@ public final class Primitives {
 
     public void writeStringMap(Map<String, String> map) {
       if (map.size() > 65535) {
-        throw new IllegalArgumentException(
-            "map exceeds u16 max entry count: " + map.size());
+        throw new IllegalArgumentException("map exceeds u16 max entry count: " + map.size());
       }
       writeU16(map.size());
       for (Map.Entry<String, String> entry : map.entrySet()) {
