@@ -81,7 +81,16 @@ public final class Connection implements AutoCloseable {
     socket.setTcpNoDelay(true);
 
     Connection conn = new Connection(socket);
-    conn.performHandshake(apiKey);
+    try {
+      conn.performHandshake(apiKey);
+    } catch (IOException e) {
+      try {
+        socket.close();
+      } catch (IOException suppressed) {
+        e.addSuppressed(suppressed);
+      }
+      throw e;
+    }
     conn.readLoop.start();
     return conn;
   }
@@ -188,8 +197,12 @@ public final class Connection implements AutoCloseable {
     byte[] handshakeFrame = Codec.encodeHandshake(0, Opcodes.PROTOCOL_VERSION, apiKey);
     send(handshakeFrame);
 
-    // Read the response synchronously (before read loop starts)
-    Frame response = readFrame();
+    // Read the response synchronously (before read loop starts).
+    // Loop to skip continuation frames (readFrame returns null for them).
+    Frame response;
+    do {
+      response = readFrame();
+    } while (response == null);
     if (response.header().opcode() == Opcodes.HANDSHAKE_OK) {
       Primitives.Reader r = new Primitives.Reader(response.body());
       int negotiatedVersion = r.readU16();

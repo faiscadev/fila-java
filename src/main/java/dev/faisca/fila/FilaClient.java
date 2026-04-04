@@ -148,7 +148,10 @@ public final class FilaClient implements AutoCloseable {
         }
       }
       return results;
-    } catch (IOException | InterruptedException e) {
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new FilaException("enqueueMany failed", e);
+    } catch (IOException e) {
       throw new FilaException("enqueueMany failed", e);
     }
   }
@@ -240,9 +243,13 @@ public final class FilaClient implements AutoCloseable {
                             msgQueue));
                   }
                 }
-              } catch (IOException | InterruptedException e) {
+              } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
                 if (!cancelled.get()) {
-                  // Unexpected error
+                  throw new FilaException("consume stream failed", e);
+                }
+              } catch (IOException e) {
+                if (!cancelled.get()) {
                   throw new FilaException("consume stream failed", e);
                 }
               } finally {
@@ -294,7 +301,10 @@ public final class FilaClient implements AutoCloseable {
       if (errorCode != Opcodes.ERR_OK) {
         throw mapErrorCode(errorCode, "ack failed");
       }
-    } catch (IOException | InterruptedException e) {
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new FilaException("ack failed", e);
+    } catch (IOException e) {
       throw new FilaException("ack failed", e);
     }
   }
@@ -329,7 +339,10 @@ public final class FilaClient implements AutoCloseable {
       if (errorCode != Opcodes.ERR_OK) {
         throw mapErrorCode(errorCode, "nack failed");
       }
-    } catch (IOException | InterruptedException e) {
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new FilaException("nack failed", e);
+    } catch (IOException e) {
       throw new FilaException("nack failed", e);
     }
   }
@@ -359,7 +372,10 @@ public final class FilaClient implements AutoCloseable {
         String queueId = r.readString();
         throw mapErrorCode(errorCode, "createQueue: " + queueId);
       }
-    } catch (IOException | InterruptedException e) {
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new FilaException("createQueue failed", e);
+    } catch (IOException e) {
       throw new FilaException("createQueue failed", e);
     }
   }
@@ -386,7 +402,10 @@ public final class FilaClient implements AutoCloseable {
       if (errorCode != Opcodes.ERR_OK) {
         throw mapErrorCode(errorCode, "deleteQueue failed");
       }
-    } catch (IOException | InterruptedException e) {
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new FilaException("deleteQueue failed", e);
+    } catch (IOException e) {
       throw new FilaException("deleteQueue failed", e);
     }
   }
@@ -409,7 +428,10 @@ public final class FilaClient implements AutoCloseable {
       if (errorCode != Opcodes.ERR_OK) {
         throw mapErrorCode(errorCode, "setConfig failed");
       }
-    } catch (IOException | InterruptedException e) {
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new FilaException("setConfig failed", e);
+    } catch (IOException e) {
       throw new FilaException("setConfig failed", e);
     }
   }
@@ -433,7 +455,10 @@ public final class FilaClient implements AutoCloseable {
         throw mapErrorCode(errorCode, "getConfig failed");
       }
       return r.readString();
-    } catch (IOException | InterruptedException e) {
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new FilaException("getConfig failed", e);
+    } catch (IOException e) {
       throw new FilaException("getConfig failed", e);
     }
   }
@@ -457,7 +482,10 @@ public final class FilaClient implements AutoCloseable {
         throw mapErrorCode(errorCode, "redrive failed");
       }
       return r.readU64();
-    } catch (IOException | InterruptedException e) {
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new FilaException("redrive failed", e);
+    } catch (IOException e) {
       throw new FilaException("redrive failed", e);
     }
   }
@@ -490,7 +518,10 @@ public final class FilaClient implements AutoCloseable {
       String key = r.readString();
       boolean superadmin = r.readBool();
       return new String[] {keyId, key, String.valueOf(superadmin)};
-    } catch (IOException | InterruptedException e) {
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new FilaException("createApiKey failed", e);
+    } catch (IOException e) {
       throw new FilaException("createApiKey failed", e);
     }
   }
@@ -513,7 +544,10 @@ public final class FilaClient implements AutoCloseable {
       if (errorCode != Opcodes.ERR_OK) {
         throw mapErrorCode(errorCode, "revokeApiKey failed");
       }
-    } catch (IOException | InterruptedException e) {
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new FilaException("revokeApiKey failed", e);
+    } catch (IOException e) {
       throw new FilaException("revokeApiKey failed", e);
     }
   }
@@ -536,7 +570,10 @@ public final class FilaClient implements AutoCloseable {
       if (errorCode != Opcodes.ERR_OK) {
         throw mapErrorCode(errorCode, "setAcl failed");
       }
-    } catch (IOException | InterruptedException e) {
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new FilaException("setAcl failed", e);
+    } catch (IOException e) {
       throw new FilaException("setAcl failed", e);
     }
   }
@@ -577,7 +614,10 @@ public final class FilaClient implements AutoCloseable {
         return messageId;
       }
       throw mapErrorCode(errorCode, "enqueue: " + messageId);
-    } catch (IOException | InterruptedException e) {
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new FilaException("enqueue failed", e);
+    } catch (IOException e) {
       throw new FilaException("enqueue failed", e);
     }
   }
@@ -598,11 +638,11 @@ public final class FilaClient implements AutoCloseable {
         FilaClient leaderClient =
             new FilaClient(leaderConn, caCertPem, clientCertPem, clientKeyPem, apiKey, null);
         ConsumerHandle handle = leaderClient.consume(queue, handler);
-        // Block until the consumer is cancelled (the thread will run)
-        // This is called from within the consumer thread, so we just let it run
+        // Block until the consumer thread finishes. This method is called from
+        // within the original consumer thread, so blocking here is expected.
+        handle.awaitDone();
       } finally {
-        // Connection will be closed when the temporary client is GC'd or when
-        // the consumer finishes
+        leaderConn.close();
       }
     } catch (Exception e) {
       throw new FilaException("failed to connect to leader at " + leaderAddr, e);

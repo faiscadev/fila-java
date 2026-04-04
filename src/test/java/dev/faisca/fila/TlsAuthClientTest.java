@@ -71,6 +71,16 @@ class TlsAuthClientTest {
     }
   }
 
+  private static String fullExceptionMessage(Throwable t) {
+    StringBuilder sb = new StringBuilder();
+    for (Throwable cur = t; cur != null; cur = cur.getCause()) {
+      if (cur.getMessage() != null) {
+        sb.append(cur.getMessage()).append(" | ");
+      }
+    }
+    return sb.toString();
+  }
+
   @Test
   void rejectWithoutApiKey() {
     // Without an API key on an auth-enabled server, the FIBP handshake is rejected.
@@ -83,6 +93,13 @@ class TlsAuthClientTest {
                     .withTlsCaCert(server.caCertPem())
                     .withTlsClientCert(server.clientCertPem(), server.clientKeyPem())
                     .build());
-    assertNotNull(ex.getMessage());
+    // The exception may wrap the root cause; check full chain for auth-related content.
+    String fullMessage = fullExceptionMessage(ex);
+    assertTrue(
+        fullMessage.contains("handshake rejected")
+            || fullMessage.contains("unauthorized")
+            || fullMessage.contains("auth")
+            || fullMessage.contains("rejected"),
+        "expected auth-related error in exception chain, got: " + fullMessage);
   }
 }

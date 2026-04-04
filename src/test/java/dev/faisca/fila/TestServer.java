@@ -88,7 +88,10 @@ final class TestServer {
           throw new RuntimeException("createQueue failed: code=" + code);
         }
       }
-    } catch (IOException | InterruptedException e) {
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new RuntimeException("createQueue failed", e);
+    } catch (IOException e) {
       throw new RuntimeException("createQueue failed", e);
     }
   }

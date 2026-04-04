@@ -78,6 +78,10 @@ public final class Primitives {
 
     public void writeString(String value) {
       byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+      if (bytes.length > 65535) {
+        throw new IllegalArgumentException(
+            "string exceeds u16 max length: " + bytes.length + " bytes");
+      }
       writeU16(bytes.length);
       ensureCapacity(bytes.length);
       buf.put(bytes);
@@ -90,6 +94,10 @@ public final class Primitives {
     }
 
     public void writeStringMap(Map<String, String> map) {
+      if (map.size() > 65535) {
+        throw new IllegalArgumentException(
+            "map exceeds u16 max entry count: " + map.size());
+      }
       writeU16(map.size());
       for (Map.Entry<String, String> entry : map.entrySet()) {
         writeString(entry.getKey());
@@ -182,6 +190,10 @@ public final class Primitives {
 
     public byte[] readBytes() {
       int len = readU32AsInt();
+      if (len < 0 || len > buf.remaining()) {
+        throw new IllegalArgumentException(
+            "invalid byte array length: " + len + " (remaining: " + buf.remaining() + ")");
+      }
       byte[] bytes = new byte[len];
       buf.get(bytes);
       return bytes;

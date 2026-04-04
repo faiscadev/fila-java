@@ -80,7 +80,7 @@ public final class Codec {
     return encodeFrame(Opcodes.CANCEL_CONSUME, (byte) 0, requestId, new byte[0]);
   }
 
-  /** Encode an Ack frame (0x15). */
+  /** Encode an Ack frame (0x16). */
   public static byte[] encodeAck(int requestId, String[] queues, String[] messageIds) {
     Primitives.Writer w = new Primitives.Writer(128);
     w.writeU32(queues.length);
@@ -91,7 +91,7 @@ public final class Codec {
     return encodeFrame(Opcodes.ACK, (byte) 0, requestId, w.toByteArray());
   }
 
-  /** Encode a Nack frame (0x17). */
+  /** Encode a Nack frame (0x18). */
   public static byte[] encodeNack(
       int requestId, String[] queues, String[] messageIds, String[] errors) {
     Primitives.Writer w = new Primitives.Writer(128);

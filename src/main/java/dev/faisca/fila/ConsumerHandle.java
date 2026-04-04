@@ -19,4 +19,13 @@ public final class ConsumerHandle {
       Thread.currentThread().interrupt();
     }
   }
+
+  /** Block until the consumer thread finishes (without cancelling). */
+  void awaitDone() {
+    try {
+      thread.join();
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    }
+  }
 }
