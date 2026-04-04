@@ -93,13 +93,11 @@ class BatchClientTest {
   void autoBatchingEnqueue() throws Exception {
     try (FilaClient client =
         FilaClient.builder(server.address()).withBatchMode(BatchMode.auto()).build()) {
-      // Enqueue messages through the auto batcher
       String msgId =
           client.enqueue("test-batch-auto", Map.of("mode", "auto"), "auto-msg".getBytes());
       assertNotNull(msgId);
       assertFalse(msgId.isEmpty());
 
-      // Verify the message can be consumed
       CountDownLatch latch = new CountDownLatch(1);
       AtomicReference<ConsumeMessage> received = new AtomicReference<>();
 
@@ -127,7 +125,6 @@ class BatchClientTest {
   void autoBatchingMultipleMessages() throws Exception {
     try (FilaClient client =
         FilaClient.builder(server.address()).withBatchMode(BatchMode.auto(50)).build()) {
-      // Send multiple messages quickly to exercise batching under load
       int count = 10;
       Set<String> sentIds = new HashSet<>();
       for (int i = 0; i < count; i++) {
@@ -139,7 +136,6 @@ class BatchClientTest {
       }
       assertEquals(count, sentIds.size(), "all message IDs should be unique");
 
-      // Consume all messages
       CountDownLatch latch = new CountDownLatch(count);
       Set<String> receivedIds = java.util.Collections.synchronizedSet(new HashSet<>());
 
@@ -168,7 +164,6 @@ class BatchClientTest {
       assertNotNull(msgId);
       assertFalse(msgId.isEmpty());
 
-      // Verify consumption
       CountDownLatch latch = new CountDownLatch(1);
       AtomicReference<ConsumeMessage> received = new AtomicReference<>();
 
@@ -198,7 +193,6 @@ class BatchClientTest {
       assertNotNull(msgId);
       assertFalse(msgId.isEmpty());
 
-      // Verify consumption
       CountDownLatch latch = new CountDownLatch(1);
       AtomicReference<ConsumeMessage> received = new AtomicReference<>();
 
@@ -230,7 +224,6 @@ class BatchClientTest {
 
   @Test
   void defaultBatchModeIsAuto() throws Exception {
-    // Default builder should use AUTO batching
     try (FilaClient client = FilaClient.builder(server.address()).build()) {
       String msgId =
           client.enqueue("test-batch-mixed", Map.of("default", "true"), "default-batch".getBytes());

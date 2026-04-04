@@ -72,41 +72,17 @@ class TlsAuthClientTest {
   }
 
   @Test
-  void connectWithTlsOnly() throws Exception {
-    // TLS without API key — validates TLS transport works independently of auth
-    try (FilaClient client =
-        FilaClient.builder(server.address())
-            .withTlsCaCert(server.caCertPem())
-            .withTlsClientCert(server.clientCertPem(), server.clientKeyPem())
-            .build()) {
-      // Without an API key on an auth-enabled server, the enqueue should be rejected.
-      // This validates TLS transport is working (connection succeeds) but auth is enforced.
-      RpcException ex =
-          assertThrows(
-              RpcException.class,
-              () -> client.enqueue("test-tls-auth", Map.of(), "tls-only".getBytes()));
-      assertEquals(
-          io.grpc.Status.Code.UNAUTHENTICATED,
-          ex.getCode(),
-          "should reject with UNAUTHENTICATED when no API key is provided");
-    }
-  }
-
-  @Test
   void rejectWithoutApiKey() {
-    try (FilaClient client =
-        FilaClient.builder(server.address())
-            .withTlsCaCert(server.caCertPem())
-            .withTlsClientCert(server.clientCertPem(), server.clientKeyPem())
-            .build()) {
-      RpcException ex =
-          assertThrows(
-              RpcException.class,
-              () -> client.enqueue("test-tls-auth", Map.of(), "no-key".getBytes()));
-      assertEquals(
-          io.grpc.Status.Code.UNAUTHENTICATED,
-          ex.getCode(),
-          "should reject with UNAUTHENTICATED when no API key is provided");
-    }
+    // Without an API key on an auth-enabled server, the FIBP handshake is rejected.
+    // The client.build() should throw because the connection is refused during handshake.
+    FilaException ex =
+        assertThrows(
+            FilaException.class,
+            () ->
+                FilaClient.builder(server.address())
+                    .withTlsCaCert(server.caCertPem())
+                    .withTlsClientCert(server.clientCertPem(), server.clientKeyPem())
+                    .build());
+    assertNotNull(ex.getMessage());
   }
 }

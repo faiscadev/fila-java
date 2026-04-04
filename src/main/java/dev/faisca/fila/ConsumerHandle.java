@@ -1,20 +1,18 @@
 package dev.faisca.fila;
 
-import io.grpc.Context;
-
 /** Handle for a running consume stream. Call {@link #cancel()} to stop consuming. */
 public final class ConsumerHandle {
-  private final Context.CancellableContext context;
+  private final Runnable cancelAction;
   private final Thread thread;
 
-  ConsumerHandle(Context.CancellableContext context, Thread thread) {
-    this.context = context;
+  ConsumerHandle(Runnable cancelAction, Thread thread) {
+    this.cancelAction = cancelAction;
     this.thread = thread;
   }
 
   /** Cancel the consume stream and wait for the consumer thread to finish. */
   public void cancel() {
-    context.cancel(null);
+    cancelAction.run();
     try {
       thread.join(5000);
     } catch (InterruptedException e) {

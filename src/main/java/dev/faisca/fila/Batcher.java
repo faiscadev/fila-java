@@ -1,10 +1,13 @@
 package dev.faisca.fila;
 
-import fila.v1.FilaServiceGrpc;
-import fila.v1.Service;
-import io.grpc.StatusRuntimeException;
+import dev.faisca.fila.fibp.Codec;
+import dev.faisca.fila.fibp.Connection;
+import dev.faisca.fila.fibp.Opcodes;
+import dev.faisca.fila.fibp.Primitives;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -18,13 +21,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * Background batcher that coalesces individual enqueue calls into multi-message RPCs.
  *
  * <p>Supports two modes: AUTO (opportunistic, Nagle-style) and LINGER (timer-based). The batcher
- * runs on a dedicated daemon thread and flushes RPCs on an executor pool. Uses the unified Enqueue
- * RPC with repeated messages for all batch sizes.
+ * runs on a dedicated daemon thread and flushes RPCs on an executor pool.
  */
 final class Batcher {
   private final LinkedBlockingQueue<BatchItem> queue = new LinkedBlockingQueue<>();
   private final AtomicBoolean running = new AtomicBoolean(true);
-  private final FilaServiceGrpc.FilaServiceBlockingStub stub;
+  private final Connection connection;
   private final BatchMode mode;
   private final Thread batcherThread;
   private final ExecutorService flushExecutor;
@@ -40,8 +42,8 @@ final class Batcher {
     }
   }
 
-  Batcher(FilaServiceGrpc.FilaServiceBlockingStub stub, BatchMode mode) {
-    this.stub = stub;
+  Batcher(Connection connection, BatchMode mode) {
+    this.connection = connection;
     this.mode = mode;
     this.flushExecutor = Executors.newCachedThreadPool(r -> newDaemon(r, "fila-batch-flush"));
     this.scheduler =
@@ -57,11 +59,6 @@ final class Batcher {
     this.batcherThread.start();
   }
 
-  /**
-   * Submit a message for batched enqueuing.
-   *
-   * @return a future that completes with the message ID or fails with a FilaException
-   */
   CompletableFuture<String> submit(EnqueueMessage message) {
     CompletableFuture<String> future = new CompletableFuture<>();
     if (!running.get()) {
@@ -72,7 +69,6 @@ final class Batcher {
     return future;
   }
 
-  /** Drain pending messages and shut down. Blocks until all pending flushes complete. */
   void shutdown() {
     running.set(false);
     batcherThread.interrupt();
@@ -82,7 +78,6 @@ final class Batcher {
       Thread.currentThread().interrupt();
     }
 
-    // Drain any remaining items in the queue.
     List<BatchItem> remaining = new ArrayList<>();
     queue.drainTo(remaining);
     if (!remaining.isEmpty()) {
@@ -112,7 +107,6 @@ final class Batcher {
     }
   }
 
-  /** AUTO mode: block for first message, drain any additional, flush concurrently. */
   private void runAuto() {
     int maxBatchSize = mode.getMaxBatchSize();
     while (running.get()) {
@@ -131,7 +125,6 @@ final class Batcher {
     }
   }
 
-  /** LINGER mode: buffer messages and flush when batch is full or linger timer fires. */
   private void runLinger() {
     int batchSize = mode.getMaxBatchSize();
     long lingerMs = mode.getLingerMs();
@@ -141,7 +134,6 @@ final class Batcher {
     while (running.get()) {
       try {
         if (buffer.isEmpty()) {
-          // Block for first message.
           BatchItem item = queue.take();
           buffer.add(item);
 
@@ -150,24 +142,14 @@ final class Batcher {
             buffer.clear();
             flushExecutor.submit(() -> flushBatch(toFlush));
           } else {
-            // Start linger timer.
-            final List<BatchItem> timerBuffer = buffer;
             lingerTimer =
                 scheduler.schedule(
-                    () -> {
-                      // Signal the batcher thread to flush by adding a poison pill.
-                      // The actual flush happens in the main loop.
-                      batcherThread.interrupt();
-                    },
-                    lingerMs,
-                    TimeUnit.MILLISECONDS);
+                    () -> batcherThread.interrupt(), lingerMs, TimeUnit.MILLISECONDS);
           }
         } else {
-          // Buffer has items -- wait for more or timer expiry.
           BatchItem item = queue.poll(lingerMs, TimeUnit.MILLISECONDS);
           if (item != null) {
             buffer.add(item);
-            // Drain any additional available items.
             queue.drainTo(buffer, batchSize - buffer.size());
           }
 
@@ -182,7 +164,6 @@ final class Batcher {
           }
         }
       } catch (InterruptedException e) {
-        // Timer or shutdown interrupt -- flush what we have.
         if (!buffer.isEmpty()) {
           if (lingerTimer != null) {
             lingerTimer.cancel(false);
@@ -200,65 +181,71 @@ final class Batcher {
     }
   }
 
-  /** Flush a batch of messages via the unified Enqueue RPC. */
+  @SuppressWarnings("unchecked")
   private void flushBatch(List<BatchItem> items) {
     if (items.isEmpty()) {
       return;
     }
 
-    Service.EnqueueRequest.Builder reqBuilder = Service.EnqueueRequest.newBuilder();
-    for (BatchItem item : items) {
-      reqBuilder.addMessages(
-          Service.EnqueueMessage.newBuilder()
-              .setQueue(item.message.getQueue())
-              .putAllHeaders(item.message.getHeaders())
-              .setPayload(com.google.protobuf.ByteString.copyFrom(item.message.getPayload()))
-              .build());
+    int count = items.size();
+    String[] queues = new String[count];
+    Map<String, String>[] headers = new Map[count];
+    byte[][] payloads = new byte[count][];
+
+    for (int i = 0; i < count; i++) {
+      EnqueueMessage msg = items.get(i).message;
+      queues[i] = msg.getQueue();
+      headers[i] = msg.getHeaders();
+      payloads[i] = msg.getPayload();
     }
 
+    int requestId = connection.nextRequestId();
+    byte[] frame = Codec.encodeEnqueue(requestId, queues, headers, payloads);
+
     try {
-      Service.EnqueueResponse resp = stub.enqueue(reqBuilder.build());
-      List<Service.EnqueueResult> results = resp.getResultsList();
+      Connection.Frame response = connection.sendAndReceive(frame, requestId, 30_000);
+      byte opcode = response.header().opcode();
+
+      if (opcode == Opcodes.ERROR) {
+        FilaException ex = FilaClient.mapErrorFrame(response.body());
+        for (BatchItem item : items) {
+          item.future.completeExceptionally(ex);
+        }
+        return;
+      }
+
+      if (opcode != Opcodes.ENQUEUE_RESULT) {
+        FilaException ex = new RpcException(Opcodes.ERR_INTERNAL, "unexpected response opcode");
+        for (BatchItem item : items) {
+          item.future.completeExceptionally(ex);
+        }
+        return;
+      }
+
+      Primitives.Reader r = new Primitives.Reader(response.body());
+      long resultCount = r.readU32();
 
       for (int i = 0; i < items.size(); i++) {
         BatchItem item = items.get(i);
-        if (i < results.size()) {
-          Service.EnqueueResult result = results.get(i);
-          switch (result.getResultCase()) {
-            case MESSAGE_ID:
-              item.future.complete(result.getMessageId());
-              break;
-            case ERROR:
-              item.future.completeExceptionally(mapEnqueueResultError(result.getError()));
-              break;
-            default:
-              item.future.completeExceptionally(
-                  new RpcException(io.grpc.Status.Code.INTERNAL, "no result from server"));
-              break;
+        if (i < resultCount) {
+          int errorCode = r.readU8();
+          String messageId = r.readString();
+          if (errorCode == Opcodes.ERR_OK) {
+            item.future.complete(messageId);
+          } else {
+            item.future.completeExceptionally(FilaClient.mapErrorCode(errorCode, messageId));
           }
         } else {
           item.future.completeExceptionally(
-              new RpcException(
-                  io.grpc.Status.Code.INTERNAL,
-                  "server returned fewer results than messages sent"));
+              new RpcException(Opcodes.ERR_INTERNAL, "server returned fewer results than sent"));
         }
       }
-    } catch (StatusRuntimeException e) {
-      FilaException mapped = FilaClient.mapEnqueueError(e);
+    } catch (IOException | InterruptedException e) {
+      FilaException ex = new FilaException("batch enqueue failed", e);
       for (BatchItem item : items) {
-        item.future.completeExceptionally(mapped);
+        item.future.completeExceptionally(ex);
       }
     }
-  }
-
-  private static FilaException mapEnqueueResultError(Service.EnqueueError error) {
-    return switch (error.getCode()) {
-      case ENQUEUE_ERROR_CODE_QUEUE_NOT_FOUND ->
-          new QueueNotFoundException("enqueue: " + error.getMessage());
-      case ENQUEUE_ERROR_CODE_PERMISSION_DENIED ->
-          new RpcException(io.grpc.Status.Code.PERMISSION_DENIED, error.getMessage());
-      default -> new RpcException(io.grpc.Status.Code.INTERNAL, error.getMessage());
-    };
   }
 
   private static Thread newDaemon(Runnable r, String name) {
